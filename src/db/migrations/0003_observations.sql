@@ -44,6 +44,7 @@ CREATE TABLE observations (
   body_digest  text NOT NULL,
   seq          integer NOT NULL,          -- ordered revision index per station/variable/time
   supersedes   uuid REFERENCES observations(id),
+  is_official_final boolean NOT NULL DEFAULT false, -- authority's declared final record for its period
   quarantined  boolean NOT NULL DEFAULT false,
   quarantine_reason text,
   created_at   timestamptz NOT NULL DEFAULT now(),
