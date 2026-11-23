@@ -157,42 +157,63 @@ export function classifyError(err: unknown): TransportFault {
  * SDK-compatible fixture transport for contract tests — exercises the same
  * idempotency/status/bounty surface. Evidence class: fixture, never live.
  */
+export interface FixtureTransport extends DelphiTransport {
+  submissions: Map<string, { key: string; req: SubmitRequest; status: string }>;
+  submitCalls: number;
+  setJudged(j: { verdict: string; bountyAmount: string; bountyState: string; zeroPayReason?: string } | undefined): void;
+  setCanSubmit(v: boolean): void;
+  setSubmitsLeft(v: number): void;
+  failNextSubmit(mode: "timeout" | "network" | "rate_limit", retryAfterSeconds?: number): void;
+  setOutage(v: boolean): void;
+  setMarketRows(
+    decoys: { marketAddress: string; verdict?: string | null; bounty?: { amount: string; state: string } | null; zeroPayReason?: string }[],
+    includeTarget?: boolean,
+  ): void;
+}
+
 export function makeFixtureTransport(seedState: {
   termsAccepted?: boolean;
   canSubmit?: boolean;
   submitsLeft?: number;
   failNext?: "timeout" | "network";       // next submit loses its response
   judged?: { verdict: string; bountyAmount: string; bountyState: string; zeroPayReason?: string };
-} = {}): DelphiTransport & {
-  submissions: Map<string, { key: string; req: SubmitRequest; status: string; judged?: typeof seedState.judged }>;
-  submitCalls: number;
-} {
+} = {}): FixtureTransport {
   const submissions = new Map<string, { key: string; req: SubmitRequest; status: string; judged?: typeof seedState.judged }>();
   const byKey = new Map<string, string>();
   const state = {
     termsAccepted: seedState.termsAccepted ?? true,
     canSubmit: seedState.canSubmit ?? true,
     submitsLeft: seedState.submitsLeft ?? 10,
-    failNext: seedState.failNext,
+    failNext: seedState.failNext
+      ? { mode: seedState.failNext, retryAfterSeconds: 0 }
+      : undefined as { mode: "timeout" | "network" | "rate_limit"; retryAfterSeconds: number } | undefined,
+    outage: false,
     judged: seedState.judged,
     decoys: undefined as { marketAddress: string; verdict: string | null; bounty: { amount: string; state: string } | null; zeroPayReason?: string }[] | undefined,
     includeTarget: true as boolean,
     submissions, submitCalls: 0,
   };
   let n = 0;
+  const outageFault = () =>
+    new TransportFault("network", 0, "outage", "provider unreachable (simulated outage)");
   const t: DelphiTransport = {
     async submit(p) {
       state.submitCalls++;
+      if (state.outage) throw outageFault();
       if (state.failNext) {
-        // the write lands remotely; the response is lost — the classic ambiguous send
-        const mode = state.failNext;
+        const { mode, retryAfterSeconds } = state.failNext;
         state.failNext = undefined;
+        if (mode === "rate_limit") {
+          // 429: nothing landed remotely; safe to retry after Retry-After
+          throw new TransportFault("http", 429, "rate_limited", "too many requests", retryAfterSeconds);
+        }
+        // the write lands remotely; the response is lost — the classic ambiguous send
         if (!byKey.has(p.idempotencyKey)) {
           const id = `sub-${++n}`;
           byKey.set(p.idempotencyKey, id);
           submissions.set(id, { key: p.idempotencyKey, req: p, status: "queued" });
         }
-        throw new TransportFault(mode === "timeout" ? "timeout" : "network", 0, mode, `simulated ${mode}`);
+        throw new TransportFault(mode, 0, mode, `simulated ${mode}`);
       }
       if (byKey.has(p.idempotencyKey)) {
         // provider idempotency: same key returns the original submission
@@ -205,6 +226,7 @@ export function makeFixtureTransport(seedState: {
       return { remoteId: id, status: "queued", requestId: `req-${id}`, raw: { id } };
     },
     async getSubmission(remoteId, marketAddress) {
+      if (state.outage) throw outageFault();
       const s = submissions.get(remoteId);
       if (!s) throw new TransportFault("http", 404, "not_found", "submission not found");
       if (state.judged) s.status = "judged";
@@ -232,12 +254,15 @@ export function makeFixtureTransport(seedState: {
       };
     },
     async getEntryState() {
+      if (state.outage) throw outageFault();
       return { canSubmit: state.canSubmit, remainingOnMarket: state.canSubmit ? 3 : 0 };
     },
     async getLimits() {
+      if (state.outage) throw outageFault();
       return { submitsLeftThisHour: state.submitsLeft, dailyCapLeft: 50 };
     },
     async getTerms() {
+      if (state.outage) throw outageFault();
       return { version: "v1", url: "https://terms.example/v1", acceptedAt: state.termsAccepted ? "2026-01-01T00:00:00Z" : null };
     },
   };
@@ -247,7 +272,10 @@ export function makeFixtureTransport(seedState: {
     setJudged(j: typeof seedState.judged) { state.judged = j; },
     setCanSubmit(v: boolean) { state.canSubmit = v; },
     setSubmitsLeft(v: number) { state.submitsLeft = v; },
-    failNextSubmit(mode: "timeout" | "network") { state.failNext = mode; },
+    failNextSubmit(mode: "timeout" | "network" | "rate_limit", retryAfterSeconds = 0) {
+      state.failNext = { mode, retryAfterSeconds };
+    },
+    setOutage(v: boolean) { state.outage = v; },
     /** provider reports other markets' rows (before and/or without ours) */
     setMarketRows(
       decoys: { marketAddress: string; verdict?: string | null; bounty?: { amount: string; state: string } | null; zeroPayReason?: string }[],
@@ -258,5 +286,5 @@ export function makeFixtureTransport(seedState: {
     },
   });
   Object.defineProperty(out, "submitCalls", { get: () => state.submitCalls, enumerable: true });
-  return out as never;
+  return out as FixtureTransport;
 }

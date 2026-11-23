@@ -27,7 +27,7 @@ export async function runWorkerLoop(deps: WorkerDeps): Promise<() => Promise<voi
         tickers.outbox = () => m.outboxTick(deps.pool, deps.config, deps.clock, deps.workerId);
       } else if (role === "poll") {
         const m = await import("../modules/outbox.ts");
-        tickers.poll = () => m.pollTick(deps.pool, deps.config, deps.clock);
+        tickers.poll = async () => { await m.pollTick(deps.pool, deps.config, deps.clock); };
       } else if (role === "research") {
         const m = await import("../modules/research.ts");
         tickers.research = () => m.researchTick(deps.pool, deps.clock);

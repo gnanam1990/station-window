@@ -2,7 +2,7 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    include: ["test/**/*.spec.ts"],
+    include: ["test/**/*.spec.{ts,tsx}"],
     testTimeout: 60_000,
     hookTimeout: 60_000,
     // Integration tests share the Postgres container; run files serially.

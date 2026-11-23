@@ -5,6 +5,7 @@ import { convertUnit, dimensionOf } from "../core/units.ts";
 import { compareDecimal } from "../core/decimal.ts";
 import type { RequestContext } from "../auth.ts";
 import { requireRole } from "../auth.ts";
+import type { Clock } from "../core/clock.ts";
 import type { Db } from "../db/pool.ts";
 import { withTx } from "../db/pool.ts";
 
@@ -256,7 +257,20 @@ export async function approveCandidate(db: Db, ctx: RequestContext, candidateId:
   requireRole(ctx, "editor");
   return withTx(db as pg.Pool, async (tx) => {
     const c = await loadCandidate(tx, ctx, candidateId);
-    if (c.status !== "pending_review") throw conflict("not_reviewable", `candidate is ${c.status}`);
+    if (c.status !== "pending_review") {
+      // a superseded draft names its successor so the caller can show a diff
+      const { rows: kids } = c.status === "superseded"
+        ? await tx.query(
+            `SELECT id, version, note_text, citation_set, status FROM candidates
+             WHERE parent_id=$1 AND desk_id=$2 ORDER BY version DESC LIMIT 1`,
+            [c.id, ctx.deskId])
+        : { rows: [] as Record<string, unknown>[] };
+      throw conflict("not_reviewable", `candidate is ${c.status}`, {
+        status: c.status,
+        staleVersion: c.version, staleNote: c.note_text,
+        supersededBy: kids[0] ?? null,
+      });
+    }
     const cits = c.citation_set as Citation[];
     const { rows } = await tx.query(
       `INSERT INTO approvals(id, desk_id, candidate_id, candidate_version, note_digest, citations_hash,
@@ -361,6 +375,40 @@ export async function assertApprovalSendable(db: Db, ctx: RequestContext, approv
   if (a.citations_hash !== citationsHash(a.cur_cits as Citation[]))
     throw conflict("citation_mismatch", "citation set changed since approval");
   return a;
+}
+
+/**
+ * Worker role: propose a draft for every verified binding that has an
+ * evaluation but no candidate yet. Failures skip the binding — a binding with
+ * no usable samples simply produces nothing this tick.
+ */
+export async function researchTick(pool: pg.Pool, clock: Clock) {
+  const { rows } = await pool.query(
+    `SELECT DISTINCT rb.desk_id, rb.id AS binding_id
+     FROM rule_bindings rb
+     JOIN evaluations e ON e.rule_binding_id=rb.id AND e.desk_id=rb.desk_id
+     WHERE rb.status='verified'
+       AND NOT EXISTS (SELECT 1 FROM candidates c WHERE c.rule_binding_id=rb.id)
+     LIMIT 10`);
+  for (const r of rows) {
+    // created_by is a principals FK — attribute drafts to a real desk principal
+    const { rows: ps } = await pool.query(
+      `SELECT p.id FROM principals p JOIN memberships m ON m.principal_id=p.id
+       WHERE p.desk_id=$1 AND m.role='analyst' AND p.active
+       UNION ALL
+       SELECT p.id FROM principals p WHERE p.desk_id=$1 AND p.active
+       LIMIT 1`,
+      [r.desk_id]);
+    if (ps.length === 0) continue; // no principal to attribute — cannot create a draft honestly
+    const ctx: RequestContext = {
+      deskId: r.desk_id as string, deskSlug: "",
+      principalId: ps[0].id as string,
+      role: "analyst", authKind: "api_key", clock,
+    };
+    try {
+      await runResearch(pool, ctx, { ruleBindingId: r.binding_id as string });
+    } catch { /* unusable evaluation — leave for a later tick */ }
+  }
 }
 
 export async function listCandidates(db: Db, ctx: RequestContext, ruleBindingId?: string) {

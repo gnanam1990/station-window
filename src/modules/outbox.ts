@@ -22,7 +22,7 @@ import {
  * idempotency key, which the provider collapses to the original submission.
  */
 
-const SLOT_MAX = 3;
+export const SLOT_MAX = 3;
 const LEASE_MS = 60_000;
 const MAX_ATTEMPTS = 8;
 
@@ -113,7 +113,7 @@ export async function createIntent(
 
 export function resolveTransport(config: AppConfig): DelphiTransport | null {
   if (config.transportOverride) return config.transportOverride;
-  if (config.liveSubmissionsEnabled && config.delphiBaseUrl && config.delphiApiKey)
+  if (config.mode === "competition" && config.liveSubmissionsEnabled && config.delphiBaseUrl && config.delphiApiKey)
     return createSdkTransport(config);
   return null;
 }
@@ -329,6 +329,28 @@ async function recordRemote(
       [intent.id],
     );
   });
+}
+
+/** CLI/worker name for one dispatch pass. */
+export async function outboxTick(
+  pool: pg.Pool, config: AppConfig, clock: Clock, workerId: string,
+): Promise<void> {
+  await dispatchTick(pool, config, clock, { workerId });
+}
+
+/**
+ * CLI path: create (or reuse) the intent for an approval, then run one
+ * dispatch pass. `requestId` is accepted for operator correlation; the
+ * intent's own idempotency key stays authoritative for provider dedup.
+ */
+export async function dispatchApproval(
+  pool: pg.Pool, ctx: RequestContext, config: AppConfig,
+  approvalId: string, _requestId?: string,
+) {
+  const { intent, created } = await createIntent(pool, ctx, { approvalId });
+  const dispatched = await dispatchTick(
+    pool, config, ctx.clock, { workerId: `cli-${process.pid}` });
+  return { intent, created, dispatched };
 }
 
 /** Poll remote state: judgment and bounty stay separate from the local verdict. */

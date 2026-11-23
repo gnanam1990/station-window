@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { sha256, uuid } from "./core/ids.js";
-import type { Db } from "./db/pool.ts";
+import type pg from "pg";
+import { withTx, type Db } from "./db/pool.ts";
 import type { Role } from "./auth.ts";
 
 export interface SeededKeys {
@@ -8,48 +9,34 @@ export interface SeededKeys {
   keys: Record<Role, string>;
 }
 
-/** Create (or return) a desk with one principal per scope. Prints nothing; keys returned to caller. */
-export async function seedDesk(db: Db, slug = "demo", mode = "dev"): Promise<SeededKeys> {
-  let deskId: string;
-  const existing = await db.query("SELECT id FROM desks WHERE slug=$1", [slug]);
-  if (existing.rows.length > 0) {
-    deskId = existing.rows[0].id as string;
-  } else {
-    deskId = uuid();
-    await db.query("INSERT INTO desks(id, slug, display_name, deployment_mode) VALUES ($1,$2,$3,$4)", [
-      deskId,
-      slug,
-      `Desk ${slug}`,
-      mode,
-    ]);
-  }
-  const keys = {} as Record<Role, string>;
-  for (const role of ["analyst", "editor", "worker", "auditor"] as Role[]) {
-    const key = `swk_${slug}_${role}_${randomBytes(16).toString("hex")}`;
-    const pid = uuid();
-    await db.query(
-      `INSERT INTO principals(id, desk_id, kind, display_name, api_key_hash)
-       VALUES ($1,$2,$3,$4,$5)
-       ON CONFLICT (api_key_hash) DO NOTHING`,
-      [pid, deskId, role === "worker" ? "worker" : "user", `${slug}-${role}`, sha256(key)],
+/** Return newly issued bootstrap keys only once per desk and role. */
+export async function seedDesk(pool: pg.Pool, slug = "demo", mode = "dev"): Promise<SeededKeys> {
+  return withTx(pool, async (db) => {
+    const { rows: [desk] } = await db.query(
+      `INSERT INTO desks(id, slug, display_name, deployment_mode) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (slug) DO UPDATE SET slug=EXCLUDED.slug RETURNING id`,
+      [uuid(), slug, `Desk ${slug}`, mode],
     );
-    const inserted = await db.query(
-      `INSERT INTO memberships(desk_id, principal_id, role) VALUES ($1,$2,$3)
-       ON CONFLICT (desk_id, principal_id) DO NOTHING RETURNING principal_id`,
-      [deskId, pid, role],
-    );
-    if (inserted.rows.length > 0) keys[role] = key;
-    else {
-      // desk already had principals; regenerate is not possible without the old key — report
-      const { rows } = await db.query(
-        `SELECT p.id FROM principals p JOIN memberships m ON m.principal_id=p.id
-         WHERE p.desk_id=$1 AND m.role=$2 LIMIT 1`,
-        [deskId, role],
+    const { rows: existing } = await db.query("SELECT DISTINCT role FROM memberships WHERE desk_id=$1", [desk.id]);
+    const roles = new Set(existing.map((row) => row.role as Role));
+    const keys = {} as Record<Role, string>;
+    for (const role of ["analyst", "editor", "worker", "auditor"] as const) {
+      if (roles.has(role)) {
+        keys[role] = "(existing — key not recoverable)";
+        continue;
+      }
+      const key = `swk_${slug}_${role}_${randomBytes(16).toString("hex")}`;
+      const principal = uuid();
+      await db.query(
+        "INSERT INTO principals(id, desk_id, kind, display_name, api_key_hash) VALUES ($1,$2,$3,$4,$5)",
+        [principal, desk.id, role === "worker" ? "worker" : "user", `${slug}-${role}`, sha256(key)],
       );
-      keys[role] = rows.length ? "(existing — key not recoverable)" : key;
+      await db.query("INSERT INTO memberships(desk_id, principal_id, role) VALUES ($1,$2,$3)",
+        [desk.id, principal, role]);
+      keys[role] = key;
     }
-  }
-  return { deskId, keys };
+    return { deskId: desk.id as string, keys };
+  });
 }
 
 /** Test helper: always creates a fresh desk with fresh printable keys. */

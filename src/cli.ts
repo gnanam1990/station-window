@@ -155,7 +155,9 @@ try {
     }
     case "restore": {
       const { restoreDesk } = await import("./modules/ops.ts");
-      console.log(JSON.stringify(await restoreDesk(pool, arg("file")!, arg("desk"))));
+      // --replace required to overwrite an existing desk (destructive, explicit)
+      console.log(JSON.stringify(await restoreDesk(
+        pool, arg("file")!, arg("desk"), { replace: args.includes("--replace") })));
       break;
     }
     case "doctor": {

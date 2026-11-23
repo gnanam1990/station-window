@@ -124,7 +124,7 @@ describe("T-017 wrong unit via model stub is rejected", () => {
     });
     const body = res.body as {
       validation: { ok: boolean; reason?: string };
-      candidate: { status: string; block_reason: string | null };
+      candidate: { id: string; status: string; block_reason: string | null };
       manualEditAvailable: boolean;
     };
     expect(body.validation.ok).toBe(false);
