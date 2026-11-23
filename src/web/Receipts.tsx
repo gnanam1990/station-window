@@ -3,8 +3,8 @@ import type { ApiClient } from "./api.ts";
 import { fmtDual } from "./common.ts";
 
 interface Intent { id: string; state: string; block_reason: string | null; market_address: string; created_at: string; updated_at: string; attempts: number }
-interface Receipt { intent_id: string; kind: string; remote_id: string | null; remote_status: string | null; received_at: string }
-interface Reward { intent_id: string; remote_status: string; verdict: string | null; bounty_amount_raw: string | null; bounty_state: string | null; zero_pay_reason: string | null; last_poll_at: string }
+interface Receipt { intent_id: string; remote_id: string; remote_status: string | null; received_at: string }
+interface Reward { intent_id: string; remote_status: string; verdict: string | null; bounty_amount_raw: string | null; bounty_state: string | null; zero_pay_reason: string | null; last_poll_at: string | null }
 interface Alert { caseId: string; intentId: string; openedAt: string; action: string; detail: unknown }
 
 export function Receipts({ client, onError, registerRefresh }: {
@@ -29,10 +29,12 @@ export function Receipts({ client, onError, registerRefresh }: {
   if (!d) return <p aria-busy>Loading receipts…</p>;
 
   const reconcile = async () => {
-    // reconciliation is a provider status read — never a new send by default
-    await client.post("/api/outbox/poll").catch(onError);
-    setReconciled(true);
-    await load().catch(onError);
+    setReconciled(false);
+    try {
+      await client.post("/api/ops/reconcile");
+      await load();
+      setReconciled(true);
+    } catch (err) { onError(err); }
   };
 
   return (
@@ -47,13 +49,13 @@ export function Receipts({ client, onError, registerRefresh }: {
           {d.alerts.map((a) => (
             <p key={a.caseId}>
               Intent {a.intentId.slice(0, 8)} opened {fmtDual(a.openedAt, "UTC")} —{" "}
-              <button type="button" onClick={() => void reconcile()}>Reconcile (read remote state)</button>
+              {client.role === "worker" ? <button type="button" onClick={() => void reconcile()}>Reconcile</button> : "Awaiting worker reconciliation"}
               {" "}· a new send is not the default action.
             </p>
           ))}
         </div>
       )}
-      {reconciled && <p role="status" className="ok">Remote state re-read; classification updated from the provider.</p>}
+      {reconciled && <p role="status" className="ok">Reconciliation completed. Outstanding cases remain listed above.</p>}
 
       <h3>Local preparation</h3>
       <ul className="receipt-list">
@@ -73,13 +75,16 @@ export function Receipts({ client, onError, registerRefresh }: {
 
       <h3>Remote judgment</h3>
       <ul className="receipt-list">
+        {d.remoteJudgment.receipts.map(r => (
+          <li key={r.remote_id}>Receipt <strong>{r.remote_id}</strong> · {r.remote_status} · {fmtDual(r.received_at, "UTC")}</li>
+        ))}
         {d.remoteJudgment.rewards.map((r) => (
           <li key={r.intent_id}>
             intent {r.intent_id.slice(0, 8)} · remote status <strong>{r.remote_status}</strong>
-            {r.verdict ? ` · verdict ${r.verdict}` : ""} · last poll {fmtDual(r.last_poll_at, "UTC")}
+            {r.verdict ? ` · verdict ${r.verdict}` : ""} · last poll {r.last_poll_at ? fmtDual(r.last_poll_at, "UTC") : "awaiting first poll"}
           </li>
         ))}
-        {d.remoteJudgment.rewards.length === 0 && <li className="muted">none</li>}
+        {d.remoteJudgment.rewards.length === 0 && d.remoteJudgment.receipts.length === 0 && <li className="muted">none</li>}
       </ul>
 
       <h3>Money</h3>

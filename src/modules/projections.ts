@@ -292,9 +292,9 @@ export async function deskReceipts(db: Db, ctx: RequestContext) {
     [ctx.deskId],
   );
   const { rows: receipts } = await db.query(
-    `SELECT r.intent_id, r.kind, r.remote_id, r.remote_status, r.received_at
+    `SELECT r.intent_id, r.remote_id, r.raw_status AS remote_status, r.observed_at AS received_at
      FROM receipts r JOIN intents i ON i.id=r.intent_id WHERE i.desk_id=$1
-     ORDER BY r.received_at DESC`,
+     ORDER BY r.observed_at DESC`,
     [ctx.deskId],
   );
   const { rows: rewards } = await db.query(
