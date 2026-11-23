@@ -1,0 +1,79 @@
+import type { Db } from "../db/pool.ts";
+import type { RequestContext } from "../auth.ts";
+
+export interface GateResult {
+  eligible: boolean;
+  reasons: string[];
+  /** The exact server timestamp the decision used. */
+  timestampUsed: string;
+  detail?: Record<string, unknown>;
+}
+
+/**
+ * Dispatch eligibility gate, re-checked immediately before every send.
+ * Fails closed: unknown terms/cutoffs, missing rights, or unsynchronized clocks block.
+ */
+export async function checkDispatchEligibility(
+  db: Db,
+  ctx: RequestContext,
+  opts: { marketVersionId?: string; bindingId?: string },
+): Promise<GateResult> {
+  const reasons: string[] = [];
+  const now = ctx.clock.now();
+  const timestampUsed = now.toISOString();
+
+  const { rows } = await db.query(
+    `SELECT mv.id AS mv_id, mv.cutoff_at, mv.is_competition_entry, mv.market_address,
+            rb.id AS rb_id, rb.status AS rb_status, rb.station_id
+     FROM market_versions mv
+     LEFT JOIN LATERAL (SELECT * FROM rule_bindings r WHERE r.market_version_id=mv.id
+                        ORDER BY r.version DESC LIMIT 1) rb ON true
+     WHERE mv.desk_id=$1 AND ($2::uuid IS NULL OR mv.id=$2) AND ($3::uuid IS NULL OR rb.id=$3)
+     LIMIT 1`,
+    [ctx.deskId, opts.marketVersionId ?? null, opts.bindingId ?? null],
+  );
+  if (rows.length === 0) {
+    return { eligible: false, reasons: ["market_not_found"], timestampUsed };
+  }
+  const r = rows[0];
+  if (!r.is_competition_entry) reasons.push("not_competition_entry");
+  if (r.cutoff_at === null) {
+    reasons.push("cutoff_unknown");
+  } else if (now.getTime() >= new Date(r.cutoff_at as string).getTime()) {
+    reasons.push("cutoff_passed");
+  }
+  if (!r.rb_id) reasons.push("no_binding");
+  else if (r.rb_status !== "verified") reasons.push(`binding_${r.rb_status}`);
+
+  // submission rights: a source policy for the bound station must allow can_submit
+  if (r.station_id) {
+    const pol = await db.query(
+      `SELECT can_submit, expires_at, status FROM source_policies
+       WHERE desk_id=$1 AND station_id=$2 AND status='active'
+       ORDER BY policy_version DESC LIMIT 1`,
+      [ctx.deskId, r.station_id],
+    );
+    if (pol.rows.length === 0) reasons.push("no_source_rights");
+    else {
+      const p = pol.rows[0];
+      if (!p.can_submit) reasons.push("submission_rights_withdrawn");
+      if (p.expires_at && new Date(p.expires_at as string).getTime() <= now.getTime())
+        reasons.push("rights_expired");
+    }
+  }
+
+  // recovery hold (restored backups hold sends until reconciliation resolves)
+  const hold = await db.query(
+    "SELECT value FROM desk_settings WHERE desk_id=$1 AND key='recovery.hold'",
+    [ctx.deskId],
+  );
+  if (hold.rows.length > 0 && (hold.rows[0].value as { active?: boolean }).active)
+    reasons.push("recovery_hold");
+
+  return {
+    eligible: reasons.length === 0,
+    reasons,
+    timestampUsed,
+    detail: { marketAddress: r.market_address, cutoffAt: r.cutoff_at },
+  };
+}

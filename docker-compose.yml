@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: station-window-db
+    environment:
+      POSTGRES_USER: station
+      POSTGRES_PASSWORD: station_local_dev
+      POSTGRES_DB: station_window
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - station-window-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U station -d station_window"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  station-window-pgdata:

@@ -1,0 +1,42 @@
+{
+  "name": "station-window",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Station Window - forecast desk evidence workflow for Delphi competition markets",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "migrate": "tsx src/cli.ts migrate",
+    "dev": "tsx watch src/server.ts",
+    "worker": "tsx src/worker.ts",
+    "cli": "tsx src/cli.ts",
+    "web": "vite",
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "vitest run test/integration",
+    "test:browser": "vitest run test/browser",
+    "replay": "tsx src/cli.ts replay",
+    "doctor": "tsx src/cli.ts doctor"
+  },
+  "dependencies": {
+    "fastify": "^5.2.0",
+    "pg": "^8.13.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3",
+    "vitest": "^2.1.8"
+  }
+}
