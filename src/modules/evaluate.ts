@@ -1,4 +1,4 @@
-import { applyOperator, type Operator } from "../core/decimal.ts";
+import { applyOperator, compareDecimal, divDecimal, maxDecimal, meanDecimal, minDecimal, type Operator } from "../core/decimal.ts";
 import { contentDigest, uuid } from "../core/ids.ts";
 import { localDayWindow, type DayDefinition } from "../core/tz.ts";
 import { convertUnit } from "../core/units.ts";
@@ -18,6 +18,8 @@ export interface EvaluatedSample {
   publishedAt: string | null;
   value: string | null;
   unit: string;
+  sourceValue: string | null;  // as published by the source (pre-conversion)
+  sourceUnit: string;
   quality: string;
   comparison: boolean | null; // operator(value, threshold); null = not computable
   interimFact: boolean;
@@ -37,7 +39,10 @@ export interface EvalResult {
   excluded: { observationId: string | null; reason: string }[];
   claim: { operator: string; threshold: string; unit: string; variable: string } | null;
   claimSupported: boolean | null; // strict predicate over interim samples
-  finalAggregate: { method: string; value: string | null; coverage: number | null } | null;
+  finalAggregate: {
+    method: string; value: string | null; coverage: number | null;
+    binsOccupied?: number; binsExpected?: number;
+  } | null;
   reasons: string[];
   asOf: string;
   inputsDigest: string;
@@ -47,6 +52,11 @@ export interface EvalResult {
  * Typed window evaluation over immutable inputs at a declared as-of instant.
  * Replay is reproducible: same rule + input set + as_of → same result (INV-04/05).
  */
+/** coverage (decimal string) vs minCoverage (0..1) → -1 | 0 | 1 */
+function compareCoverage(coverage: string, min: number): number {
+  return compareDecimal(coverage, String(min)) ?? -1;
+}
+
 export async function evaluate(db: Db, ctx: RequestContext, input: EvalInput): Promise<EvalResult> {
   const asOf = input.asOf ?? ctx.clock.now();
   const { rows } = await db.query(
@@ -109,10 +119,12 @@ export async function evaluate(db: Db, ctx: RequestContext, input: EvalInput): P
       continue;
     }
     let value: string | null = null;
-    if (o.canonical_value !== null) {
-      value = String(o.canonical_value);
-    } else if (o.value_num !== null) {
-      const c = convertUnit(String(o.value_num), o.unit as string, b.unit as string);
+    // Always compare in the binding's declared unit: canonical storage is
+    // degC/m; a binding may predicate on degF etc. (QA vector: 10 °C = 50 °F).
+    if (o.canonical_value !== null || o.value_num !== null) {
+      const fromVal = String(o.canonical_value ?? o.value_num);
+      const fromUnit = String(o.canonical_unit ?? o.unit);
+      const c = convertUnit(fromVal, fromUnit, b.unit as string);
       if (c === null) {
         excluded.push({ observationId: o.id, reason: "unsupported_unit_conversion" });
         continue;
@@ -133,12 +145,19 @@ export async function evaluate(db: Db, ctx: RequestContext, input: EvalInput): P
       publishedAt: o.published_at ? new Date(o.published_at).toISOString() : null,
       value,
       unit: b.unit as string,
+      sourceValue: o.value_text === null ? null : String(o.value_text),
+      sourceUnit: o.unit as string,
       quality: o.quality,
       comparison,
       interimFact: usable,
       reason: usable ? undefined : `not_usable:${o.quality}`,
     };
-    if (o.is_official_final && usable) officialFinal = s;
+    // an official final only counts when the authority's publication is actually
+    // known at the as-of instant — flag alone is not evidence of publication.
+    if (
+      o.is_official_final && o.published_at !== null &&
+      new Date(o.published_at) <= asOf && usable
+    ) officialFinal = s;
     samples.push(s);
   }
 
@@ -174,31 +193,47 @@ export async function evaluate(db: Db, ctx: RequestContext, input: EvalInput): P
   };
   let finalAggregate: EvalResult["finalAggregate"] = null;
   let verdict: EvalResult["verdict"];
+  const windowMature = win.endUtc.getTime() <= asOf.getTime();
   if (pol.method === "official_daily_publication") {
     if (officialFinal) {
       finalAggregate = { method: pol.method, value: officialFinal.value, coverage: 1 };
       verdict = "final";
     } else {
       verdict = usable.length > 0 ? "incomplete" : "no_evidence";
-      reasons.push("no_official_final");
+      reasons.push(
+        samples.some((s) => s.publishedAt !== null && new Date(s.publishedAt) > asOf)
+          ? "official_final_not_yet_published"
+          : "no_official_final",
+      );
     }
   } else if (pol.method === "sample_aggregate" && pol.aggregate && pol.cadenceMinutes) {
+    // coverage counts unique occupied cadence bins — 24 readings in one hour is
+    // one covered hour, not a full day.
+    const cadenceMs = pol.cadenceMinutes * 60_000;
     const expected = Math.max(
       1,
-      Math.floor((win.endUtc.getTime() - win.startUtc.getTime()) / (pol.cadenceMinutes * 60_000)),
+      Math.ceil((win.endUtc.getTime() - win.startUtc.getTime()) / cadenceMs),
     );
-    const coverage = usable.length / expected;
-    if (coverage >= (pol.minCoverage ?? 1)) {
-      const vals = usable.map((s) => Number(s.value));
+    const occupied = new Set(
+      usable.map((s) =>
+        Math.floor((Date.parse(s.observedAt) - win.startUtc.getTime()) / cadenceMs)),
+    );
+    const coverage = divDecimal(String(occupied.size), String(expected), 6) ?? "0";
+    if (windowMature && compareCoverage(coverage, pol.minCoverage ?? 1) >= 0) {
+      const vals = usable.map((s) => s.value!);
       const agg =
-        pol.aggregate === "max" ? Math.max(...vals)
-        : pol.aggregate === "min" ? Math.min(...vals)
-        : vals.reduce((a, c) => a + c, 0) / vals.length;
-      finalAggregate = { method: `${pol.method}:${pol.aggregate}`, value: String(agg), coverage };
+        pol.aggregate === "max" ? maxDecimal(vals)
+        : pol.aggregate === "min" ? minDecimal(vals)
+        : meanDecimal(vals);
+      finalAggregate = {
+        method: `${pol.method}:${pol.aggregate}`, value: agg, coverage: Number(coverage),
+        binsOccupied: occupied.size, binsExpected: expected,
+      };
       verdict = "final";
     } else {
       verdict = usable.length > 0 ? "incomplete" : "no_evidence";
-      reasons.push(`insufficient_coverage:${coverage.toFixed(3)}`);
+      if (!windowMature) reasons.push("window_not_mature");
+      reasons.push(`insufficient_coverage:${coverage}`);
     }
   } else {
     // no declared aggregate method → interim only

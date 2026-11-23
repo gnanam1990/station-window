@@ -196,12 +196,22 @@ describe("T-015 incomplete vs verified official aggregate", () => {
     expect(r.verdict).toBe("incomplete");
     expect(r.reasons).toContain("no_official_final");
 
-    // the authority publishes its official daily aggregate → final even with desk gaps
-    await env.pool.query(
-      `UPDATE observations SET is_official_final=true, published_at='2026-11-30T23:30:00Z'
-       WHERE desk_id=$1 AND station_id=$2 AND observed_at='2026-11-30T14:00:00Z'`,
+    // the authority re-publishes the same value as its official daily final via
+    // the normal sourced path → a new ordered observation version, not a mutation
+    await ingest(keys, policyId, [
+      JSON.stringify({
+        observedAt: "2026-11-30T14:00:00Z",
+        fields: { air_temperature: "-0.5" },
+        officialFinal: true,
+        publishedAt: "2026-11-30T23:30:00Z",
+      }),
+    ]);
+    const { rows: versions } = await env.pool.query(
+      `SELECT seq, is_official_final FROM observations
+       WHERE desk_id=$1 AND station_id=$2 AND observed_at='2026-11-30T14:00:00Z' ORDER BY seq`,
       [keys.deskId, stationUuid],
     );
+    expect(versions.map((v) => [v.seq, v.is_official_final])).toEqual([[1, false], [2, true]]);
     const res2 = await api(env, "POST", "/api/evaluations", {
       key: keys.keys.analyst,
       payload: { ruleBindingId: bindingId, asOf: "2026-12-01T00:00:00Z" },
@@ -209,6 +219,62 @@ describe("T-015 incomplete vs verified official aggregate", () => {
     const r2 = res2.body as { verdict: string; finalAggregate: { method: string } | null };
     expect(r2.verdict).toBe("final");
     expect(r2.finalAggregate?.method).toBe("official_daily_publication");
+  });
+
+  it("converts canonical→binding units and counts cadence bins, not samples (QA vector)", async () => {
+    const keys = await seed(env, "desk-qa-boundary");
+    const { bindingId, policyId } = await setupBinding(keys, {
+      address: "QA-TEMP", stationExternal: "EXAMPLE-A", localDate: "2026-11-30",
+      zone: "UTC", unit: "degF", operator: "gt", threshold: "40",
+      aggregatePolicy: { method: "sample_aggregate", aggregate: "mean", cadenceMinutes: 60, minCoverage: 1 },
+    });
+    env.clock.set(new Date("2026-11-30T12:01:00Z"));
+    // 24 readings all inside a single hour of a 24-hour window
+    const lines = Array.from({ length: 24 }, (_, i) =>
+      synthLine(`2026-11-30T09:${String(i).padStart(2, "0")}:00Z`, "10"));
+    await ingest(keys, policyId, lines);
+    const res = await api(env, "POST", "/api/evaluations", {
+      key: keys.keys.analyst,
+      payload: { ruleBindingId: bindingId, asOf: "2026-11-30T12:01:00Z" },
+    });
+    const r = res.body as {
+      verdict: string; claimSupported: boolean; reasons: string[];
+      samples: { value: string; unit: string; sourceValue: string }[];
+      finalAggregate: { coverage: number; binsOccupied: number; binsExpected: number } | null;
+    };
+    // 10 °C must compare as 50 °F against a >40 °F claim
+    expect(Number(r.samples[0]!.value)).toBe(50);
+    expect(r.samples[0]!.unit).toBe("degF");
+    expect(r.samples[0]!.sourceValue).toBe("10");
+    expect(r.claimSupported).toBe(true);
+    // one covered hour of 24 → cannot finalize
+    expect(r.verdict).not.toBe("final");
+    expect(r.reasons).toContain("window_not_mature");
+    expect(r.reasons.some((x) => x.startsWith("insufficient_coverage"))).toBe(true);
+  });
+
+  it("re-registration converges on (station,dataset,variable,endpoint); a second endpoint is a mirror policy", async () => {
+    const keys = await seed(env, "desk-converge");
+    const stId = await stationId("EXAMPLE-A");
+    const base = {
+      stationId: stId, dataset: "synthetic", variable: "air_temperature",
+      endpointUrl: "https://training.example/feed",
+    };
+    const a = await api(env, "POST", "/api/sources", { key: keys.keys.editor, payload: base });
+    const a2 = await api(env, "POST", "/api/sources", { key: keys.keys.editor, payload: base });
+    expect(a.status).toBe(200);
+    expect(a2.status).toBe(200);
+    const p1 = a.body as { id: string; policy_version: number };
+    const p2 = a2.body as { id: string; policy_version: number };
+    expect(p2.id).toBe(p1.id);
+    expect(p2.policy_version).toBe(2);
+    // a different endpoint for the same tuple is a distinct (mirror) policy
+    const m = await api(env, "POST", "/api/sources", {
+      key: keys.keys.editor,
+      payload: { ...base, endpointUrl: "https://mirror.training.example/feed-copy" },
+    });
+    expect(m.status).toBe(200);
+    expect((m.body as { id: string }).id).not.toBe(p1.id);
   });
 
   it("evaluation is reproducible: same inputs + as_of → identical result digest", async () => {

@@ -189,8 +189,10 @@ export async function parseIntoObservations(
       const canonical =
         ext.valueNum !== null ? convertUnit(ext.valueNum, ext.unit, ext.canonicalUnit) : null;
       const rowDigest = sha256(`${p.desk_id}|${p.station_id}|${p.dataset}|${p.variable}|${row.observedAt.toISOString()}|${ext.valueText}`);
+      const officialFinal = (row as { officialFinal?: boolean }).officialFinal === true;
+      const publishedAt = (row as { publishedAt?: Date | null }).publishedAt ?? null;
       const latest = await client2.query(
-        `SELECT id, seq, value_num, body_digest FROM observations
+        `SELECT id, seq, value_num, body_digest, is_official_final, published_at FROM observations
          WHERE desk_id=$1 AND station_id=$2 AND dataset=$3 AND variable=$4 AND observed_at=$5
          ORDER BY seq DESC LIMIT 1`,
         [p.desk_id, p.station_id, p.dataset, p.variable, row.observedAt],
@@ -200,40 +202,67 @@ export async function parseIntoObservations(
         const sameValue =
           (prev.value_num === null && ext.valueNum === null) ||
           (prev.value_num !== null && ext.valueNum !== null && String(prev.value_num) === ext.valueNum);
-        if (sameValue && prev.body_digest === rowDigest && !quarantine) {
+        const sameFlags =
+          Boolean(prev.is_official_final) === officialFinal &&
+          (prev.published_at === null ? null : new Date(prev.published_at).toISOString()) ===
+            (publishedAt === null ? null : publishedAt.toISOString());
+        if (sameValue && prev.body_digest === rowDigest && !quarantine && sameFlags) {
+          // identical re-ingest → value no-op, but a different policy is a new
+          // citation path for the same bytes (mirror provenance)
+          await client2.query(
+            `INSERT INTO observation_sources(id, desk_id, observation_id, source_policy_id, snapshot_id, endpoint_url, line_locator, first_seen_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (observation_id, source_policy_id) DO NOTHING`,
+            [uuid(), p.desk_id, prev.id, p.id, snapshotId, p.endpoint_url, row.lineLocator, meta.fetchedAt],
+          );
           deduped++;
-          continue; // identical re-ingest → still one version
+          continue;
         }
-        // changed value for the same station/time → ordered new version, original kept
+        // changed value or changed publication state (e.g. authority declaring
+        // the same value its official final) → ordered new version, original kept
+        const newId = uuid();
         await client2.query(
           `INSERT INTO observations
-            (id, desk_id, station_id, dataset, variable, observed_at, first_seen_at, value_text,
-             value_num, unit, canonical_value, canonical_unit, quality, qc_flag, parser_version,
-             snapshot_id, line_locator, body_digest, seq, supersedes, quarantined, quarantine_reason)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+            (id, desk_id, station_id, dataset, variable, observed_at, published_at, first_seen_at,
+             value_text, value_num, unit, canonical_value, canonical_unit, quality, qc_flag,
+             parser_version, snapshot_id, line_locator, body_digest, seq, supersedes,
+             is_official_final, quarantined, quarantine_reason)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
           [
-            uuid(), p.desk_id, p.station_id, p.dataset, p.variable, row.observedAt, meta.fetchedAt,
-            ext.valueText, ext.valueNum, ext.unit, canonical, ext.canonicalUnit,
+            newId, p.desk_id, p.station_id, p.dataset, p.variable, row.observedAt, publishedAt,
+            meta.fetchedAt, ext.valueText, ext.valueNum, ext.unit, canonical, ext.canonicalUnit,
             ext.quality, ext.qcFlag, parserVersion, snapshotId, row.lineLocator, rowDigest,
-            Number(prev.seq) + 1, prev.id, quarantine, quarantine ? "future_observed_time" : null,
+            Number(prev.seq) + 1, prev.id, officialFinal,
+            quarantine, quarantine ? "future_observed_time" : null,
           ],
+        );
+        await client2.query(
+          `INSERT INTO observation_sources(id, desk_id, observation_id, source_policy_id, snapshot_id, endpoint_url, line_locator, first_seen_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (observation_id, source_policy_id) DO NOTHING`,
+          [uuid(), p.desk_id, newId, p.id, snapshotId, p.endpoint_url, row.lineLocator, meta.fetchedAt],
         );
         newVersions++;
         if (quarantine) quarantined++;
         continue;
       }
+      const newId = uuid();
       await client2.query(
         `INSERT INTO observations
-          (id, desk_id, station_id, dataset, variable, observed_at, first_seen_at, value_text,
-           value_num, unit, canonical_value, canonical_unit, quality, qc_flag, parser_version,
-           snapshot_id, line_locator, body_digest, seq, quarantined, quarantine_reason)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,1,$19,$20)`,
+          (id, desk_id, station_id, dataset, variable, observed_at, published_at, first_seen_at,
+           value_text, value_num, unit, canonical_value, canonical_unit, quality, qc_flag,
+           parser_version, snapshot_id, line_locator, body_digest, seq, is_official_final,
+           quarantined, quarantine_reason)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,1,$20,$21,$22)`,
         [
-          uuid(), p.desk_id, p.station_id, p.dataset, p.variable, row.observedAt, meta.fetchedAt,
-          ext.valueText, ext.valueNum, ext.unit, canonical, ext.canonicalUnit,
+          newId, p.desk_id, p.station_id, p.dataset, p.variable, row.observedAt, publishedAt,
+          meta.fetchedAt, ext.valueText, ext.valueNum, ext.unit, canonical, ext.canonicalUnit,
           ext.quality, ext.qcFlag, parserVersion, snapshotId, row.lineLocator, rowDigest,
-          quarantine, quarantine ? "future_observed_time" : null,
+          officialFinal, quarantine, quarantine ? "future_observed_time" : null,
         ],
+      );
+      await client2.query(
+        `INSERT INTO observation_sources(id, desk_id, observation_id, source_policy_id, snapshot_id, endpoint_url, line_locator, first_seen_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (observation_id, source_policy_id) DO NOTHING`,
+        [uuid(), p.desk_id, newId, p.id, snapshotId, p.endpoint_url, row.lineLocator, meta.fetchedAt],
       );
       inserted++;
       if (quarantine) quarantined++;
@@ -261,16 +290,27 @@ interface SyntheticRow {
   observedAt: Date;
   fields: Record<string, string>;
   lineLocator: string;
+  /** authority-declared finality + publication instant, carried as source data */
+  officialFinal?: boolean;
+  publishedAt?: Date | null;
 }
 
 function parseSynthetic(body: string): { rows: SyntheticRow[] } {
-  // synthetic fixture format: JSON lines {observedAt, fields:{VAR:"1.2"}}
+  // synthetic fixture format: JSON lines {observedAt, fields:{VAR:"1.2"},
+  //   officialFinal?:bool, publishedAt?:iso}
   const rows: SyntheticRow[] = [];
   body.split(/\r?\n/).forEach((line, i) => {
     const t = line.trim();
     if (!t || t.startsWith("#")) return;
-    const j = JSON.parse(t) as { observedAt: string; fields: Record<string, string> };
-    rows.push({ observedAt: new Date(j.observedAt), fields: j.fields, lineLocator: `line:${i + 1}` });
+    const j = JSON.parse(t) as {
+      observedAt: string; fields: Record<string, string>;
+      officialFinal?: boolean; publishedAt?: string;
+    };
+    rows.push({
+      observedAt: new Date(j.observedAt), fields: j.fields, lineLocator: `line:${i + 1}`,
+      officialFinal: j.officialFinal === true,
+      publishedAt: j.publishedAt ? new Date(j.publishedAt) : null,
+    });
   });
   return { rows };
 }

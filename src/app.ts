@@ -145,6 +145,8 @@ export async function buildApp(deps?: Partial<AppDeps>): Promise<FastifyInstance
   registerSourceRoutes(app, pool, config, clock);
   const { registerEvaluationRoutes } = await import("./routes/evaluations.ts");
   registerEvaluationRoutes(app, pool);
+  const { registerResearchRoutes } = await import("./routes/research.ts");
+  registerResearchRoutes(app, pool);
 
   return app;
 }

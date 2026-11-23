@@ -43,14 +43,17 @@ export async function registerSourcePolicy(db: Db, ctx: RequestContext, input: S
   if (u.protocol !== "https:" && u.protocol !== "http:")
     throw badRequest("endpointUrl scheme must be http(s); fetcher still enforces https + allowlist");
   const id = uuid();
-  await db.query(
+  // Re-registering the same (station,dataset,variable,endpoint) converges onto
+  // the existing policy row; a different endpoint is a separate policy (mirror).
+  const { rows } = await db.query(
     `INSERT INTO source_policies
       (id, desk_id, station_id, dataset, variable, endpoint_url, cadence_seconds,
        can_browse, can_retain, can_submit, can_export, retention_until, expires_at,
        verification_evidence)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-     ON CONFLICT (desk_id, station_id, dataset, variable)
-     DO UPDATE SET endpoint_url=EXCLUDED.endpoint_url, can_browse=EXCLUDED.can_browse,
+     ON CONFLICT (desk_id, station_id, dataset, variable, endpoint_url)
+     DO UPDATE SET can_browse=EXCLUDED.can_browse,
+       cadence_seconds=EXCLUDED.cadence_seconds,
        can_retain=EXCLUDED.can_retain, can_submit=EXCLUDED.can_submit,
        can_export=EXCLUDED.can_export, retention_until=EXCLUDED.retention_until,
        expires_at=EXCLUDED.expires_at, verification_evidence=EXCLUDED.verification_evidence,
@@ -66,7 +69,6 @@ export async function registerSourcePolicy(db: Db, ctx: RequestContext, input: S
       input.verificationEvidence ?? null,
     ],
   );
-  const { rows } = await db.query("SELECT id, policy_version FROM source_policies WHERE id=$1", [id]);
   return rows[0];
 }
 
