@@ -311,13 +311,13 @@ describe("T-026 429 Retry-After then outage: backoff respected, next retry expos
     const intent = (c.body as { intent: { id: string } }).intent;
     const submits0 = transport.submitCalls;
 
-    // provider answers 429 with Retry-After: 120 — the intent backs off, never lost
-    transport.failNextSubmit("rate_limit", 120);
+    // provider answers 429 with Retry-After: 600 — honored verbatim (> old 300s cap)
+    transport.failNextSubmit("rate_limit", 600);
     await api(env, "POST", "/api/outbox/tick", { key: keys.keys.worker, payload: { workerId: "w1" } });
     const { rows: rs } = await env.pool.query(
       "SELECT next_at, attempts FROM retry_schedule WHERE intent_id=$1", [intent.id]);
     const nextAt = new Date(rs[0].next_at as string).getTime();
-    expect(nextAt - env.clock.now().getTime()).toBe(120_000);
+    expect(nextAt - env.clock.now().getTime()).toBe(600_000);
     const { rows: st } = await env.pool.query("SELECT state FROM intents WHERE id=$1", [intent.id]);
     expect(st[0].state).toBe("READY"); // eligible later, not blocked
 

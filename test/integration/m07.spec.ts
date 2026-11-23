@@ -270,3 +270,108 @@ describe("shared provider market quota", () => {
     expect(slots.rows.filter(s => s.state === "reserved").map(s => s.slot_index).sort()).toEqual([1, 2, 3]);
   });
 });
+
+describe("M07 stale-worker takeover fencing", () => {
+  it("a late stale-worker error never downgrades newer confirmed state", async () => {
+    const keys = await seed(env, "desk-stale");
+    const { approvalId } = await approvalFor(keys, "0xMKT-STALE");
+    const enq = await api(env, "POST", "/api/intents", { key: keys.keys.editor, payload: { approvalId } });
+    const intentId = (enq.body as { intent: { id: string } }).intent.id;
+
+    // deferred transport: the first submit hangs until the test releases it
+    let release!: (err?: Error) => void;
+    const gate = new Promise<void>((res, rej) => {
+      release = (err) => (err ? rej(err) : res());
+    });
+    let gatedSubmits = 0;
+    const { TransportFault } = await import("../../src/modules/delphi.ts");
+    const { dispatchTick } = await import("../../src/modules/outbox.ts");
+    const { reconcileTick } = await import("../../src/modules/recovery.ts");
+    const gated = {
+      ...transport,
+      submit: async (p: Parameters<typeof transport.submit>[0]) => {
+        gatedSubmits++;
+        if (gatedSubmits === 1) await gate; // worker A's send stays in flight
+        return transport.submit(p);
+      },
+    };
+
+    // worker A: claims lease + attempt atomically, submit is in-flight
+    const tickA = dispatchTick(env.pool, env.config, env.clock,
+      { workerId: "w-stale-A", transport: gated, deskId: keys.deskId });
+    for (let i = 0; i < 100 && gatedSubmits === 0; i++)
+      await new Promise((r) => setTimeout(r, 10));
+    expect(gatedSubmits).toBe(1);
+
+    // A's lease expires mid-flight; recovery returns only the LATEST expired lease
+    await env.pool.query(
+      "UPDATE attempts SET lease_expires_at=$1 WHERE intent_id=$2",
+      [new Date(0), intentId]);
+    const rec = await reconcileTick(env.pool, env.config, env.clock);
+    expect(rec.leasesRecovered).toBe(1);
+    const { rows: st0 } = await env.pool.query(
+      "SELECT state FROM intents WHERE id=$1", [intentId]);
+    expect(st0[0].state).toBe("READY");
+
+    // worker B: re-leases at epoch 2, resubmits the same key → REMOTE_KNOWN
+    await dispatchTick(env.pool, env.config, env.clock,
+      { workerId: "w-stale-B", transport: gated, deskId: keys.deskId });
+    expect(gatedSubmits).toBe(2);
+    const { rows: st1 } = await env.pool.query(
+      "SELECT state FROM intents WHERE id=$1", [intentId]);
+    expect(st1[0].state).toBe("REMOTE_KNOWN");
+
+    // A's lost response finally errors — every outcome write is fenced
+    release(new TransportFault("timeout", 0, "timeout", "lost response"));
+    await tickA;
+    const { rows: st2 } = await env.pool.query(
+      "SELECT state, block_reason FROM intents WHERE id=$1", [intentId]);
+    expect(st2[0].state).toBe("REMOTE_KNOWN"); // never downgraded to SENT_UNKNOWN
+    const { rows: openCases } = await env.pool.query(
+      "SELECT count(*)::int c FROM reconciliation_cases WHERE intent_id=$1 AND resolved_at IS NULL",
+      [intentId]);
+    expect(openCases[0].c).toBe(0); // no phantom case from the stale attempt
+    const { rows: q } = await env.pool.query(
+      "SELECT state FROM quota_reservations WHERE intent_id=$1", [intentId]);
+    expect(q[0].state).toBe("consumed"); // uncertain quota preserved through the race
+    const { rows: recs } = await env.pool.query(
+      "SELECT count(*)::int c FROM receipts WHERE intent_id=$1", [intentId]);
+    expect(recs[0].c).toBe(1); // the stale worker added no duplicate receipt
+    const { rows: atts } = await env.pool.query(
+      "SELECT epoch, result FROM attempts WHERE intent_id=$1 ORDER BY epoch", [intentId]);
+    expect(atts.length).toBe(2);
+    expect(atts[0].result).toBe("lease_expired"); // stale attempt closed by recovery
+    expect(atts[1].result).toBe("sent");
+  });
+
+  it("a refusal after a lost response holds the intent and keeps the uncertain slot", async () => {
+    const keys = await seed(env, "desk-hold");
+    const { approvalId, policyId } = await approvalFor(keys, "0xMKT-HOLD");
+    const enq = await api(env, "POST", "/api/intents", { key: keys.keys.editor, payload: { approvalId } });
+    const intentId = (enq.body as { intent: { id: string } }).intent.id;
+
+    // response lost → SENT_UNKNOWN + open reconciliation case + reserved slot
+    transport.failNextSubmit("timeout");
+    await api(env, "POST", "/api/outbox/tick", { key: keys.keys.worker, payload: { workerId: "w1" } });
+    const { rows: st } = await env.pool.query(
+      "SELECT state FROM intents WHERE id=$1", [intentId]);
+    expect(st[0].state).toBe("SENT_UNKNOWN");
+
+    // rights revoked while uncertain → refusal must HOLD, not block+release the slot
+    await api(env, "PATCH", `/api/sources/${policyId}`, {
+      key: keys.keys.editor, payload: { canSubmit: false },
+    });
+    await api(env, "POST", "/api/outbox/tick", { key: keys.keys.worker, payload: { workerId: "w2" } });
+    const { rows: st2 } = await env.pool.query(
+      "SELECT state, block_reason FROM intents WHERE id=$1", [intentId]);
+    expect(st2[0].state).toBe("HOLD");
+    expect(st2[0].block_reason).toMatch(/^uncertain_remote:/);
+    const { rows: q } = await env.pool.query(
+      "SELECT state FROM quota_reservations WHERE intent_id=$1", [intentId]);
+    expect(q[0].state).toBe("reserved"); // slot still held — remote submission may exist
+    const { rows: oc } = await env.pool.query(
+      "SELECT count(*)::int c FROM reconciliation_cases WHERE intent_id=$1 AND resolved_at IS NULL",
+      [intentId]);
+    expect(oc[0].c).toBe(1); // the uncertainty is still tracked, never guessed closed
+  });
+});

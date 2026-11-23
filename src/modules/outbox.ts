@@ -118,8 +118,10 @@ export function resolveTransport(config: AppConfig): DelphiTransport | null {
   return null;
 }
 
+type Db = Pick<pg.Pool, "query">;
+
 async function blockIntent(
-  db: pg.Pool, intent: IntentRow, reason: string, detail?: Record<string, unknown>,
+  db: Db, intent: IntentRow, reason: string, detail?: Record<string, unknown>,
 ) {
   await db.query(
     "UPDATE intents SET state='BLOCKED', block_reason=$2, updated_at=now() WHERE id=$1",
@@ -136,6 +138,28 @@ async function blockIntent(
   );
 }
 
+/**
+ * A refusal on an intent whose remote effect is uncertain (a response was
+ * lost) must not free the quota slot — the provider may already hold the
+ * submission. Hold the intent and keep the slot reserved until reconciliation
+ * reads remote state; never downgrade to a clean BLOCKED+released.
+ */
+async function refuseOrHold(
+  db: Db, intent: IntentRow, reason: string, detail?: Record<string, unknown>,
+) {
+  const { rows: openCase } = await db.query(
+    "SELECT 1 FROM reconciliation_cases WHERE intent_id=$1 AND resolved_at IS NULL LIMIT 1",
+    [intent.id]);
+  if (openCase.length > 0) {
+    await db.query(
+      `UPDATE intents SET state='HOLD', block_reason=$2, updated_at=now() WHERE id=$1`,
+      [intent.id, `uncertain_remote:${reason}`]);
+    return "held";
+  }
+  await blockIntent(db, intent, reason, detail);
+  return "blocked";
+}
+
 function workerCtx(intent: IntentRow, clock: Clock): RequestContext {
   return {
     deskId: intent.desk_id, deskSlug: "", principalId: "",
@@ -143,7 +167,7 @@ function workerCtx(intent: IntentRow, clock: Clock): RequestContext {
   };
 }
 
-async function scheduleRetry(db: pg.Pool, intentId: string, nextAt: Date) {
+async function scheduleRetry(db: Db, intentId: string, nextAt: Date) {
   await db.query(
     `INSERT INTO retry_schedule(intent_id, next_at, attempts, updated_at)
      VALUES ($1,$2,1,now())
@@ -151,6 +175,33 @@ async function scheduleRetry(db: pg.Pool, intentId: string, nextAt: Date) {
     [intentId, nextAt],
   );
   await db.query("UPDATE intents SET state='READY', updated_at=now() WHERE id=$1", [intentId]);
+}
+
+/**
+ * Run `mutate` inside a transaction only while `attemptId` still owns the
+ * intent: state must still be LEASED and the attempt must be the latest epoch.
+ * A stale worker (lease expired, intent recovered and re-leased) gets
+ * 'stale' and every write — block, retry, receipt, quota — is skipped, so a
+ * late error can never downgrade a newer confirmed state.
+ */
+async function withOwnership(
+  pool: pg.Pool, intentId: string, attemptId: string,
+  mutate: (tx: Db) => Promise<void>,
+): Promise<"applied" | "stale"> {
+  return withTx(pool, async (tx) => {
+    const { rows } = await tx.query(
+      `SELECT i.id FROM intents i
+       WHERE i.id=$1 AND i.state='LEASED'
+         AND EXISTS (
+           SELECT 1 FROM attempts a
+           WHERE a.intent_id=i.id AND a.id=$2
+             AND a.epoch=(SELECT MAX(epoch) FROM attempts WHERE intent_id=i.id))
+       FOR UPDATE`,
+      [intentId, attemptId]);
+    if (rows.length === 0) return "stale";
+    await mutate(tx);
+    return "applied";
+  });
 }
 
 /**
@@ -173,41 +224,55 @@ export async function dispatchTick(
   );
   let processed = 0;
   for (const intent of intents as IntentRow[]) {
-    // lease: exactly one worker may hold this intent
-    const leased = await pool.query(
-      "UPDATE intents SET state='LEASED', updated_at=now() WHERE id=$1 AND state IN ('READY','SENT_UNKNOWN') RETURNING id",
-      [intent.id],
-    );
-    if (leased.rows.length === 0) continue; // fenced — another worker holds it
-    const epoch = await pool.query(
-      "SELECT COALESCE(MAX(epoch),0)+1 AS e FROM attempts WHERE intent_id=$1", [intent.id]);
-    if (Number(epoch.rows[0].e) > MAX_ATTEMPTS) {
-      await blockIntent(pool, intent, "attempts_exhausted");
-      continue;
-    }
-    const attemptId = uuid();
-    await pool.query(
-      `INSERT INTO attempts(id, desk_id, intent_id, epoch, worker_id, leased_at, lease_expires_at, started_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$6)`,
-      [attemptId, intent.desk_id, intent.id, epoch.rows[0].e, opts.workerId,
-       clock.now(), new Date(clock.now().getTime() + LEASE_MS)],
-    );
+    // claim lease + attempt atomically: no attempt row exists unless this
+    // worker actually holds the lease, and epoch increments in the same tx
+    const claimed = await withTx(pool, async (tx) => {
+      const leased = await tx.query(
+        "UPDATE intents SET state='LEASED', updated_at=now() WHERE id=$1 AND state IN ('READY','SENT_UNKNOWN') RETURNING id",
+        [intent.id]);
+      if (leased.rows.length === 0) return null;
+      const epoch = await tx.query(
+        "SELECT COALESCE(MAX(epoch),0)+1 AS e FROM attempts WHERE intent_id=$1", [intent.id]);
+      const e = Number(epoch.rows[0].e);
+      if (e > MAX_ATTEMPTS) {
+        await blockIntent(tx, intent, "attempts_exhausted");
+        return "exhausted" as const;
+      }
+      const attemptId = uuid();
+      await tx.query(
+        `INSERT INTO attempts(id, desk_id, intent_id, epoch, worker_id, leased_at, lease_expires_at, started_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$6)`,
+        [attemptId, intent.desk_id, intent.id, e, opts.workerId,
+         clock.now(), new Date(clock.now().getTime() + LEASE_MS)],
+      );
+      return { attemptId, epoch: e };
+    });
+    if (claimed === null || claimed === "exhausted") continue;
+    const { attemptId } = claimed;
     processed++;
-    const finish = async (result: string, httpStatus?: number) => {
-      // stale-worker fence: only write while this attempt is still the latest epoch
-      await pool.query(
-        `UPDATE attempts SET finished_at=$2, result=$3, http_status=$4
-         WHERE id=$1 AND epoch=(SELECT MAX(epoch) FROM attempts WHERE intent_id=$5)`,
-        [attemptId, clock.now(), result, httpStatus ?? null, intent.id],
+
+    // every outcome for this attempt is fenced by ownership — one tx decides
+    const finishIn = (tx: Db) => async (result: string, httpStatus?: number) => {
+      await tx.query(
+        "UPDATE attempts SET finished_at=$2, result=$3, http_status=$4 WHERE id=$1",
+        [attemptId, clock.now(), result, httpStatus ?? null],
       );
     };
+    const outcome = (result: string, httpStatus: number | undefined,
+                     mutate: (tx: Db) => Promise<void>) =>
+      withOwnership(pool, intent.id, attemptId, async (tx) => {
+        await finishIn(tx)(result, httpStatus);
+        await mutate(tx);
+      });
+    const refuse = (reason: string, status?: number) =>
+      outcome(`refused:${reason}`, status, (tx) => refuseOrHold(tx, intent, reason).then(() => {}));
 
     // ── re-gate immediately before transmission (INV-07) ──
     const ctx = workerCtx(intent, clock);
     const sendable = await assertApprovalSendable(pool, ctx, intent.approval_id)
       .then(() => null as string | null)
       .catch((e) => (e as { code?: string }).code ?? "approval_invalid");
-    if (sendable) { await finish(`refused:${sendable}`); await blockIntent(pool, intent, sendable); continue; }
+    if (sendable) { await refuse(sendable); continue; }
 
     const gateMv = await pool.query(
       `SELECT rb.market_version_id FROM approvals a JOIN rule_bindings rb ON rb.id=a.rule_binding_id
@@ -217,42 +282,37 @@ export async function dispatchTick(
       : null;
     if (!gv?.eligible) {
       const reasons = gv?.reasons ?? ["gate_unavailable"];
-      await finish(`refused:${reasons[0]}`);
-      await blockIntent(pool, intent, reasons.join(","));
+      await refuse(reasons.join(","));
       continue;
     }
 
     if (!transport) {
-      await finish("refused:no_transport");
-      await pool.query(
-        "UPDATE intents SET state='HOLD', block_reason='live_transport_unavailable', updated_at=now() WHERE id=$1",
-        [intent.id]);
+      await outcome("refused:no_transport", undefined, async (tx) => {
+        await tx.query(
+          "UPDATE intents SET state='HOLD', block_reason='live_transport_unavailable', updated_at=now() WHERE id=$1",
+          [intent.id]);
+      });
       continue;
     }
     try {
       const terms = await transport.getTerms();
-      if (!terms.acceptedAt) {
-        await finish("refused:terms_not_accepted");
-        await blockIntent(pool, intent, "terms_not_accepted");
-        continue;
-      }
+      if (!terms.acceptedAt) { await refuse("terms_not_accepted"); continue; }
       const entry = await transport.getEntryState(intent.market_address);
       if (!entry.canSubmit || entry.remainingOnMarket <= 0) {
-        await finish("refused:entry_not_submittable");
-        await blockIntent(pool, intent, `entry_not_submittable:${entry.reason ?? "provider"}`);
+        await refuse(`entry_not_submittable:${entry.reason ?? "provider"}`);
         continue;
       }
       const limits = await transport.getLimits();
       if (limits.submitsLeftThisHour <= 0) {
-        await finish("refused:hourly_cap");
-        await scheduleRetry(pool, intent.id,
-          limits.hourEndsAt ? new Date(limits.hourEndsAt) : new Date(clock.now().getTime() + 300_000));
+        await outcome("refused:hourly_cap", undefined, (tx) =>
+          scheduleRetry(tx, intent.id,
+            limits.hourEndsAt ? new Date(limits.hourEndsAt) : new Date(clock.now().getTime() + 300_000)));
         continue;
       }
     } catch (err) {
       const f = classifyError(err);
-      await finish(`error:${f.code}`, f.status || undefined);
-      await scheduleRetry(pool, intent.id, backoff(clock, f));
+      await outcome(`error:${f.code}`, f.status || undefined, (tx) =>
+        scheduleRetry(tx, intent.id, backoff(clock, f)));
       continue;
     }
 
@@ -262,30 +322,30 @@ export async function dispatchTick(
         note: intent.payload.note, links: intent.payload.links,
         marketAddress: intent.market_address, idempotencyKey: intent.idempotency_key,
       });
-      await finish("sent");
-      await recordRemote(pool, intent, res.remoteId, res.status, res.raw, clock);
+      await outcome("sent", undefined, (tx) =>
+        recordRemote(tx, intent, res.remoteId, res.status, res.raw, clock));
     } catch (err) {
       const f = classifyError(err);
       if (f.kind === "timeout" || f.kind === "network") {
         // ambiguous: remote state is unknown — reconcile before any retry verdict
-        await finish(`sent_unknown:${f.code}`);
-        await pool.query(
-          "UPDATE intents SET state='SENT_UNKNOWN', updated_at=now() WHERE id=$1", [intent.id]);
-        await pool.query(
-          `INSERT INTO reconciliation_cases(id, desk_id, intent_id, opened_at, detail)
-           VALUES ($1,$2,$3,now(),$4)`,
-          [uuid(), intent.desk_id, intent.id,
-           JSON.stringify({ kind: f.kind, idempotencyKey: intent.idempotency_key })],
-        );
+        await outcome(`sent_unknown:${f.code}`, f.status || undefined, async (tx) => {
+          await tx.query(
+            "UPDATE intents SET state='SENT_UNKNOWN', updated_at=now() WHERE id=$1", [intent.id]);
+          await tx.query(
+            `INSERT INTO reconciliation_cases(id, desk_id, intent_id, opened_at, detail)
+             VALUES ($1,$2,$3,now(),$4)`,
+            [uuid(), intent.desk_id, intent.id,
+             JSON.stringify({ kind: f.kind, idempotencyKey: intent.idempotency_key })],
+          );
+        });
       } else if (f.code === "rate_limited" || f.retryAfterSeconds) {
-        await finish(`refused:${f.code}`, f.status);
-        await scheduleRetry(pool, intent.id, backoff(clock, f));
+        await outcome(`refused:${f.code}`, f.status, (tx) =>
+          scheduleRetry(tx, intent.id, backoff(clock, f)));
       } else if (f.code === "terms_not_accepted") {
-        await finish(`refused:${f.code}`, f.status);
-        await blockIntent(pool, intent, "terms_not_accepted");
+        await refuse("terms_not_accepted", f.status);
       } else {
-        await finish(`error:${f.code}`, f.status);
-        await scheduleRetry(pool, intent.id, backoff(clock, f));
+        await outcome(`error:${f.code}`, f.status, (tx) =>
+          scheduleRetry(tx, intent.id, backoff(clock, f)));
       }
     }
   }
@@ -293,16 +353,18 @@ export async function dispatchTick(
 }
 
 function backoff(clock: Clock, f: TransportFault): Date {
+  // provider Retry-After is honored verbatim, however long; only faults
+  // without one fall back to the local 30s floor
   const wait = f.retryAfterSeconds ? f.retryAfterSeconds * 1000 : 30_000;
-  return new Date(clock.now().getTime() + Math.min(wait, 300_000));
+  return new Date(clock.now().getTime() + wait);
 }
 
 /** Record the remote submission: receipt + slot consumption + REMOTE_KNOWN. */
 async function recordRemote(
-  pool: pg.Pool, intent: IntentRow, remoteId: string, status: string,
+  tx: Db, intent: IntentRow, remoteId: string, status: string,
   raw: unknown, clock: Clock,
 ) {
-  await withTx(pool, async (tx) => {
+  {
     // UNIQUE(provider_account, remote_id) collapses double-observation
     await tx.query(
       `INSERT INTO receipts(id, desk_id, intent_id, provider_account, remote_id, raw_status, payload, observed_at)
@@ -329,7 +391,7 @@ async function recordRemote(
        WHERE intent_id=$1 AND resolved_at IS NULL`,
       [intent.id],
     );
-  });
+  }
 }
 
 /** CLI/worker name for one dispatch pass. */

@@ -14,14 +14,30 @@ import { classifyError } from "./delphi.ts";
 export async function reconcileTick(
   pool: pg.Pool, config: AppConfig, clock: Clock, deskId?: string,
 ): Promise<{ leasesRecovered: number; casesResolved: number; casesOpen: number }> {
-  // 1. a crashed worker's expired lease must not strand the intent forever
+  // 1. a crashed worker's expired lease must not strand the intent forever.
+  //    Only the LATEST attempt's expiry recovers — an older expired attempt
+  //    may not pull the intent out from under a live newer worker. The stale
+  //    attempt row is marked closed so recovery can never fire twice.
   const { rowCount: leasesRecovered } = await pool.query(
-    `UPDATE intents SET state='READY', updated_at=now()
-     WHERE state='LEASED' AND ($2::uuid IS NULL OR desk_id=$2) AND id IN (
-       SELECT intent_id FROM attempts
-       WHERE finished_at IS NULL AND lease_expires_at < $1)`,
+    `WITH stale AS (
+       SELECT a.id AS attempt_id, a.intent_id
+       FROM attempts a
+       WHERE a.finished_at IS NULL AND a.lease_expires_at < $1
+         AND a.epoch = (SELECT MAX(epoch) FROM attempts WHERE intent_id = a.intent_id)
+         AND EXISTS (SELECT 1 FROM intents i WHERE i.id = a.intent_id AND i.state='LEASED'
+                     AND ($2::uuid IS NULL OR i.desk_id=$2))
+     )
+     UPDATE intents SET state='READY', updated_at=now()
+     WHERE id IN (SELECT intent_id FROM stale)`,
     [clock.now(), deskId ?? null],
   );
+  if ((leasesRecovered ?? 0) > 0) {
+    await pool.query(
+      `UPDATE attempts SET finished_at=now(), result='lease_expired'
+       WHERE finished_at IS NULL AND lease_expires_at < $1`,
+      [clock.now()],
+    );
+  }
 
   // 2. resolve open cases by reading provider state for the known remote id
   const { rows: cases } = await pool.query(
