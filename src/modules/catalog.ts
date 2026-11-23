@@ -42,17 +42,19 @@ export const REFERENCE_STATIONS: StationSeed[] = [
     localZone: "Asia/Shanghai",
     aliases: [{ alias: "example-b", documented: true }, { alias: "example-city", documented: false }],
   },
+  // Synthetic training stations for ambiguity drills — deliberately not real CMA
+  // identifiers, since authority-specific IDs must be verified before use.
   {
-    authority: "CMA",
-    externalId: "ZBAA",
-    cityLabel: "Beijing Capital Intl",
+    authority: "training-source",
+    externalId: "SYN-PEK-CAPITAL",
+    cityLabel: "Beijing Capital (synthetic)",
     localZone: "Asia/Shanghai",
     aliases: [{ alias: "beijing-airport", documented: true }],
   },
   {
-    authority: "CMA",
-    externalId: "ZBBB",
-    cityLabel: "Beijing Daxing",
+    authority: "training-source",
+    externalId: "SYN-PEK-DAXING",
+    cityLabel: "Beijing Daxing (synthetic)",
     localZone: "Asia/Shanghai",
     aliases: [{ alias: "beijing-airport", documented: true }],
   },

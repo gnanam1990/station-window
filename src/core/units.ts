@@ -1,13 +1,14 @@
 /** Canonical unit conversion. Unsupported pairs return null — never guess. */
 
+// factors are "units per base unit" — inBase = n / factor[from]; out = inBase * factor[to]
 const FACTORS: Record<string, Record<string, number>> = {
   temperature: { degC: 1, degF: NaN, K: NaN }, // F/K handled by formula below
-  length: { m: 1, mm: 1000, cm: 100, ft: 0.3048, km: 0.001 },
+  length: { m: 1, mm: 1000, cm: 100, km: 0.001, ft: 3.2808398950131, nmi: 1 / 1852 },
 };
 
 const DIMENSION: Record<string, keyof typeof FACTORS> = {
   degC: "temperature", degF: "temperature", K: "temperature",
-  m: "length", mm: "length", cm: "length", ft: "length", km: "length",
+  m: "length", mm: "length", cm: "length", ft: "length", km: "length", nmi: "length",
 };
 
 export function dimensionOf(unit: string): string | null {

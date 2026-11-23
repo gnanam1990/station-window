@@ -23,7 +23,8 @@ export async function checkDispatchEligibility(
   const timestampUsed = now.toISOString();
 
   const { rows } = await db.query(
-    `SELECT mv.id AS mv_id, mv.cutoff_at, mv.is_competition_entry, mv.market_address,
+    `SELECT mv.id AS mv_id, mv.cutoff_at, mv.eligibility_opens_at, mv.is_competition_entry,
+            mv.market_address, mv.rule_revision, mv.competition_id, mv.card_json,
             rb.id AS rb_id, rb.status AS rb_status, rb.station_id
      FROM market_versions mv
      LEFT JOIN LATERAL (SELECT * FROM rule_bindings r WHERE r.market_version_id=mv.id
@@ -36,7 +37,25 @@ export async function checkDispatchEligibility(
     return { eligible: false, reasons: ["market_not_found"], timestampUsed };
   }
   const r = rows[0];
+
+  // current market revision: only the latest imported revision may dispatch
+  const cur = await db.query(
+    `SELECT MAX(rule_revision) AS rev FROM market_versions
+     WHERE desk_id=$1 AND competition_id=$2 AND market_address=$3`,
+    [ctx.deskId, r.competition_id, r.market_address],
+  );
+  if (Number(cur.rows[0].rev) > Number(r.rule_revision)) reasons.push("stale_market_revision");
+
+  if (r.eligibility_opens_at && now.getTime() < new Date(r.eligibility_opens_at as string).getTime())
+    reasons.push("not_yet_open");
   if (!r.is_competition_entry) reasons.push("not_competition_entry");
+  else {
+    // provider-reported entry state on the card can refuse submission
+    const es = (r.card_json as { entryState?: { canSubmit?: boolean; remainingOnMarket?: number; reason?: string } })
+      .entryState;
+    if (es && (es.canSubmit === false || es.remainingOnMarket === 0))
+      reasons.push("entry_not_submittable");
+  }
   if (r.cutoff_at === null) {
     reasons.push("cutoff_unknown");
   } else if (now.getTime() >= new Date(r.cutoff_at as string).getTime()) {

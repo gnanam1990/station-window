@@ -113,12 +113,10 @@ export async function buildApp(deps?: Partial<AppDeps>): Promise<FastifyInstance
     const principal = await authenticateApiKey(pool, body.apiKey);
     if (!principal) throw unauthorized("invalid api key");
     const sess = await createSession(pool, principal.id, clock);
-    reply.setCookie("sw_session", sess.token, {
-      httpOnly: true,
-      sameSite: "lax",
-      path: "/",
-      secure: false, // loopback dev; set true behind TLS
-    });
+    reply.header(
+      "set-cookie",
+      `sw_session=${sess.token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${12 * 3600}`,
+    );
     return { csrf: sess.csrf, desk: principal.desk_slug, role: principal.role, expiresAt: sess.expiresAt };
   });
 
@@ -129,7 +127,7 @@ export async function buildApp(deps?: Partial<AppDeps>): Promise<FastifyInstance
         sha256(cookies["sw_session"]),
       ]);
     }
-    reply.clearCookie("sw_session", { path: "/" });
+    reply.header("set-cookie", "sw_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
     return { ok: true };
   });
 
@@ -143,6 +141,8 @@ export async function buildApp(deps?: Partial<AppDeps>): Promise<FastifyInstance
 
   const { registerMarketRoutes } = await import("./routes/markets.ts");
   registerMarketRoutes(app, pool);
+  const { registerSourceRoutes } = await import("./routes/sources.ts");
+  registerSourceRoutes(app, pool, config, clock);
 
   return app;
 }

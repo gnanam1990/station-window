@@ -47,7 +47,7 @@ CREATE TABLE observations (
   quarantined  boolean NOT NULL DEFAULT false,
   quarantine_reason text,
   created_at   timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (station_id, dataset, variable, observed_at, seq)
+  UNIQUE (desk_id, station_id, dataset, variable, observed_at, seq)
 );
 CREATE INDEX obs_lookup ON observations(desk_id, station_id, variable, observed_at);
 CREATE INDEX obs_first_seen ON observations(desk_id, first_seen_at);
