@@ -41,7 +41,7 @@ button:hover { border-color: var(--accent); }
   padding: 10px 14px; border-radius: 6px; margin: 12px 0; }
 .gap-note { border-left: 4px solid var(--hold); padding-left: 10px; }
 
-.inbox-table { overflow-x: auto; }
+.inbox-table, .table-scroll { overflow-x: auto; max-width: 100%; }
 table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { font-size: 0.85rem; color: var(--muted); font-weight: 600; }
@@ -51,7 +51,14 @@ th { font-size: 0.85rem; color: var(--muted); font-weight: 600; }
 .s-transport_uncertain { color: var(--hold); font-weight: 600; }
 .s-remote_result { color: var(--ok); font-weight: 600; }
 
-.rule-reading dd { margin-bottom: 6px; }
+.rule-reading dd { margin-bottom: 6px; overflow-wrap: anywhere; }
+dd.mono, .preview dd, .preview a, td.mono { overflow-wrap: anywhere; word-break: break-word; }
+.pt { fill: var(--accent); }
+.pt.gap { fill: var(--hold); }
+text.pt.miss { fill: var(--bad); font-size: 12px; }
+.thr-line { stroke: var(--bad); stroke-width: 1.5; stroke-dasharray: 6 4; }
+.axis { fill: var(--muted); font-size: 10px; }
+.thr-label { fill: var(--bad); font-size: 9px; }
 .note { background: #fff; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
 .diff .ins { background: #d9f2dd; text-decoration: underline; }
 .diff .del { background: #f6d5d5; text-decoration: line-through; }

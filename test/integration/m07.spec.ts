@@ -344,6 +344,49 @@ describe("M07 stale-worker takeover fencing", () => {
     expect(atts[1].result).toBe("sent");
   });
 
+  it("lease recovery is desk-scoped: desk B's expired attempt is untouched", async () => {
+    const keysA = await seed(env, "desk-lease-a");
+    const keysB = await seed(env, "desk-lease-b");
+    const a = await approvalFor(keysA, "0xMKT-LEASE-A");
+    const b = await approvalFor(keysB, "0xMKT-LEASE-B");
+    const idA = ((await api(env, "POST", "/api/intents", { key: keysA.keys.editor, payload: { approvalId: a.approvalId } }))
+      .body as { intent: { id: string } }).intent.id;
+    const idB = ((await api(env, "POST", "/api/intents", { key: keysB.keys.editor, payload: { approvalId: b.approvalId } }))
+      .body as { intent: { id: string } }).intent.id;
+
+    // both desks have a crashed worker: LEASED intent + expired latest attempt
+    const { uuid } = await import("../../src/core/ids.ts");
+    const { reconcileTick } = await import("../../src/modules/recovery.ts");
+    for (const [deskId, intentId] of [[keysA.deskId, idA], [keysB.deskId, idB]] as const) {
+      await env.pool.query("UPDATE intents SET state='LEASED' WHERE id=$1", [intentId]);
+      await env.pool.query(
+        `INSERT INTO attempts(id, desk_id, intent_id, epoch, worker_id, leased_at, lease_expires_at, started_at)
+         VALUES ($1,$2,$3,1,'dead-worker',$4,$5,$4)`,
+        [uuid(), deskId, intentId, env.clock.now(), new Date(0)]);
+    }
+
+    // a scoped recovery for desk A must not touch desk B at all
+    const rec = await reconcileTick(env.pool, env.config, env.clock, keysA.deskId);
+    expect(rec.leasesRecovered).toBe(1);
+    const { rows: ia } = await env.pool.query("SELECT state FROM intents WHERE id=$1", [idA]);
+    expect(ia[0].state).toBe("READY");
+    const { rows: aa } = await env.pool.query(
+      "SELECT result, finished_at FROM attempts WHERE intent_id=$1", [idA]);
+    expect(aa[0].result).toBe("lease_expired");
+    expect(aa[0].finished_at).not.toBeNull();
+    const { rows: ib } = await env.pool.query("SELECT state FROM intents WHERE id=$1", [idB]);
+    expect(ib[0].state).toBe("LEASED"); // still held — not freed by A's pass
+    const { rows: ab } = await env.pool.query(
+      "SELECT result, finished_at FROM attempts WHERE intent_id=$1", [idB]);
+    expect(ab[0].finished_at).toBeNull(); // attempt not closed by another desk's pass
+
+    // and a later scoped pass for B still recovers it exactly once
+    const rec2 = await reconcileTick(env.pool, env.config, env.clock, keysB.deskId);
+    expect(rec2.leasesRecovered).toBe(1);
+    const { rows: ib2 } = await env.pool.query("SELECT state FROM intents WHERE id=$1", [idB]);
+    expect(ib2[0].state).toBe("READY");
+  });
+
   it("a refusal after a lost response holds the intent and keeps the uncertain slot", async () => {
     const keys = await seed(env, "desk-hold");
     const { approvalId, policyId } = await approvalFor(keys, "0xMKT-HOLD");

@@ -49,11 +49,18 @@ export function MarketDetail({ client, bindingId, onError }: {
 
   const zone = d.rule.structured.localZone;
   const pts = d.series.points;
-  const nums = pts.map((p) => Number(p.bindingValue)).filter((v) => Number.isFinite(v));
-  const min = nums.length ? Math.min(...nums) : 0;
-  const max = nums.length ? Math.max(...nums) : 1;
+  // null bindingValue is missing — Number(null) would wrongly plot it as 0;
+  // only an actual zero value may land on the baseline
+  const nums = pts
+    .filter((p) => p.bindingValue != null)
+    .map((p) => Number(p.bindingValue));
+  const threshold = Number(d.rule.structured.threshold);
+  const domain = Number.isFinite(threshold) ? [...nums, threshold] : nums;
+  const min = domain.length ? Math.min(...domain) : 0;
+  const max = domain.length ? Math.max(...domain) : 1;
   const span = max - min || 1;
   const gapCount = pts.filter((p) => p.gapBefore).length;
+  const missingCount = pts.filter((p) => p.bindingValue == null).length;
 
   const approve = async (candidateId: string) => {
     try {
@@ -94,6 +101,7 @@ export function MarketDetail({ client, bindingId, onError }: {
       <p className="muted">
         Interval {d.series.cadenceMinutes ?? "unknown"} min · {pts.length} readings ·{" "}
         {gapCount === 0 ? "no gaps" : `${gapCount} gap${gapCount > 1 ? "s" : ""} marked below`}
+        {missingCount > 0 ? ` · ${missingCount} missing value${missingCount > 1 ? "s" : ""}` : ""}
         {" "}· units shown in {d.rule.structured.unit} (binding unit) and source unit.
       </p>
       {gapCount > 0 && (
@@ -106,17 +114,33 @@ export function MarketDetail({ client, bindingId, onError }: {
       <figure aria-label="observed series chart">
         <svg viewBox="0 0 600 160" role="img" aria-hidden={pts.length === 0}
           aria-label={`series chart, ${pts.length} points, range ${min} to ${max} ${d.rule.structured.unit}`}>
+          {Number.isFinite(threshold) && (
+            <>
+              <line className="thr-line" x1={20} x2={580}
+                y1={140 - ((threshold - min) / span) * 120}
+                y2={140 - ((threshold - min) / span) * 120} />
+              <text className="axis thr-label" x={584}
+                y={140 - ((threshold - min) / span) * 120 + 4}>thr</text>
+            </>
+          )}
           {pts.map((p, i) => {
+            const x = 20 + (i / Math.max(pts.length - 1, 1)) * 560;
+            if (p.bindingValue == null) {
+              // missing reading: mark below the axis, never as a zero point
+              return (
+                <text key={p.observationId} className="pt miss" x={x - 4} y={156}
+                  aria-hidden>×</text>
+              );
+            }
             const v = Number(p.bindingValue);
             if (!Number.isFinite(v)) return null;
-            const x = 20 + (i / Math.max(pts.length - 1, 1)) * 560;
             const y = 140 - ((v - min) / span) * 120;
             return <circle key={p.observationId} cx={x} cy={y} r={3} className={p.gapBefore ? "pt gap" : "pt"} />;
           })}
           <text x={8} y={150} className="axis">{min}</text>
           <text x={8} y={20} className="axis">{max}</text>
         </svg>
-        <figcaption className="muted">Threshold {d.rule.structured.operator} {d.rule.structured.threshold} {d.rule.structured.unit}. Table below is the accessible equivalent.</figcaption>
+        <figcaption className="muted">Dashed line: threshold {d.rule.structured.operator} {d.rule.structured.threshold} {d.rule.structured.unit}. × markers: missing readings. Table below is the accessible equivalent.</figcaption>
       </figure>
       <div role="region" aria-label="observation table" tabIndex={0} className="table-scroll">
         <table data-testid="series-table">

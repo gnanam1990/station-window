@@ -16,8 +16,10 @@ export async function reconcileTick(
 ): Promise<{ leasesRecovered: number; casesResolved: number; casesOpen: number }> {
   // 1. a crashed worker's expired lease must not strand the intent forever.
   //    Only the LATEST attempt's expiry recovers — an older expired attempt
-  //    may not pull the intent out from under a live newer worker. The stale
-  //    attempt row is marked closed so recovery can never fire twice.
+  //    may not pull the intent out from under a live newer worker. The same
+  //    CTE drives both writes atomically: the intent returns to READY and its
+  //    stale attempt is closed, jointly desk-scoped, so a recovery can never
+  //    fire twice or touch another desk's attempts.
   const { rowCount: leasesRecovered } = await pool.query(
     `WITH stale AS (
        SELECT a.id AS attempt_id, a.intent_id
@@ -26,18 +28,16 @@ export async function reconcileTick(
          AND a.epoch = (SELECT MAX(epoch) FROM attempts WHERE intent_id = a.intent_id)
          AND EXISTS (SELECT 1 FROM intents i WHERE i.id = a.intent_id AND i.state='LEASED'
                      AND ($2::uuid IS NULL OR i.desk_id=$2))
+     ),
+     recovered AS (
+       UPDATE intents SET state='READY', updated_at=now()
+       WHERE id IN (SELECT intent_id FROM stale)
+       RETURNING id
      )
-     UPDATE intents SET state='READY', updated_at=now()
-     WHERE id IN (SELECT intent_id FROM stale)`,
+     UPDATE attempts SET finished_at=now(), result='lease_expired'
+     WHERE id IN (SELECT attempt_id FROM stale)`,
     [clock.now(), deskId ?? null],
   );
-  if ((leasesRecovered ?? 0) > 0) {
-    await pool.query(
-      `UPDATE attempts SET finished_at=now(), result='lease_expired'
-       WHERE finished_at IS NULL AND lease_expires_at < $1`,
-      [clock.now()],
-    );
-  }
 
   // 2. resolve open cases by reading provider state for the known remote id
   const { rows: cases } = await pool.query(

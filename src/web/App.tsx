@@ -19,7 +19,9 @@ function parseHash(): Route {
 
 export function App({ client }: { client: ApiClient }) {
   const [route, setRoute] = useState<Route>(parseHash());
-  const [loggedIn, setLoggedIn] = useState(false);
+  // 'unknown' until the refresh-resume probe answers — session cookie restores
+  // the login without re-entering the API key
+  const [loggedIn, setLoggedIn] = useState<"unknown" | boolean>("unknown");
   const [apiKey, setApiKey] = useState("");
   const [errors, setErrors] = useState<string[]>([]);
   const [paused, setPaused] = useState(false);
@@ -32,6 +34,8 @@ export function App({ client }: { client: ApiClient }) {
     addEventListener("hashchange", on);
     return () => removeEventListener("hashchange", on);
   }, []);
+
+  useEffect(() => { void client.resume().then(setLoggedIn); }, [client]);
 
   const reportError = useCallback((e: unknown) => {
     const msg = e instanceof ApiError2 ? `${e.code}: ${e.message}` : String(e);
@@ -49,10 +53,12 @@ export function App({ client }: { client: ApiClient }) {
   }, [reportError]);
 
   useEffect(() => {
-    if (paused || !loggedIn) return;
+    if (paused || loggedIn !== true) return;
     const t = setInterval(() => void refreshAll(), 30_000);
     return () => clearInterval(t);
   }, [paused, loggedIn, refreshAll]);
+
+  if (loggedIn === "unknown") return <main className="login" aria-busy />;
 
   if (!loggedIn) {
     return (

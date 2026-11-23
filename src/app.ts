@@ -118,10 +118,13 @@ export async function buildApp(deps?: Partial<AppDeps>): Promise<FastifyInstance
     const principal = await authenticateApiKey(pool, body.apiKey);
     if (!principal) throw unauthorized("invalid api key");
     const sess = await createSession(pool, principal.id, clock);
-    reply.header(
-      "set-cookie",
+    // sw_session authenticates (HttpOnly); sw_csrf is JS-readable so the SPA
+    // can resend the CSRF header after a plain page refresh — SameSite=Lax on
+    // both keeps the double-submit guarantee
+    reply.header("set-cookie", [
       `sw_session=${sess.token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${12 * 3600}`,
-    );
+      `sw_csrf=${sess.csrf}; SameSite=Lax; Path=/; Max-Age=${12 * 3600}`,
+    ]);
     return { csrf: sess.csrf, desk: principal.desk_slug, role: principal.role, expiresAt: sess.expiresAt };
   });
 
@@ -132,7 +135,10 @@ export async function buildApp(deps?: Partial<AppDeps>): Promise<FastifyInstance
         sha256(cookies["sw_session"]),
       ]);
     }
-    reply.header("set-cookie", "sw_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
+    reply.header("set-cookie", [
+      "sw_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
+      "sw_csrf=; SameSite=Lax; Path=/; Max-Age=0",
+    ]);
     return { ok: true };
   });
 

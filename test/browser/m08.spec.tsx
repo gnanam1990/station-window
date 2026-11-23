@@ -20,7 +20,9 @@ const transport: Transport = async ({ method, path, body, headers }) => {
   return {
     status: res.status,
     body: await res.json().catch(() => ({})),
-    setCookie: res.headers.get("set-cookie") ?? undefined,
+    setCookie: (res.headers.getSetCookie?.() ?? [])
+      .concat(res.headers.get("set-cookie") ? [res.headers.get("set-cookie")!] : [])
+      .join("\n"),
   };
 };
 
@@ -113,7 +115,7 @@ describe("T-022: keyboard-only inspect → approve → refresh persists + focus 
     const user = userEvent.setup();
 
     // sign in through the normal session path
-    await user.type(screen.getByLabelText("Desk API key"), keys.keys.editor);
+    await user.type(await screen.findByLabelText("Desk API key"), keys.keys.editor);
     await user.click(screen.getByRole("button", { name: "Sign in" }));
     await screen.findByRole("heading", { name: "Market inbox" });
 
@@ -239,5 +241,75 @@ describe("T-024: stale draft approve → conflict + actionable diff", () => {
     const { rows: ap } = await env.pool.query(
       "select count(*)::int as n from approvals where candidate_id=$1", [cand.id]);
     expect(ap[0].n).toBe(0);
+  });
+});
+
+describe("observed series plot: missing vs zero vs threshold", () => {
+  it("plots only actual zeros, marks missing points, renders the threshold line", async () => {
+    const detail = {
+      asOf: "2026-11-30T12:00:00Z",
+      market: { marketVersionId: "mv", address: "0x1", competitionId: "c", isCompetitionEntry: false, evidenceCutoffAtUtc: "2026-12-01T00:00:00Z" },
+      rule: {
+        verbatim: "lowest temp below 0 °C?", status: "verified",
+        structured: { variable: "air_temperature", operator: "lt", threshold: "0.0", unit: "degC", localZone: "UTC", localDate: "2026-11-30", dayDefinition: { type: "civil" }, aggregatePolicy: {} },
+      },
+      station: { externalId: "EXAMPLE-A", authority: "training-source", cityLabel: null },
+      series: {
+        cadenceMinutes: 60,
+        points: [
+          { observationId: "o1", observedAtUtc: "2026-11-30T01:00:00Z", firstSeenAtUtc: "2026-11-30T01:05:00Z", value: "0.0", unit: "degC", bindingValue: "0.0", bindingUnit: "degC", quality: "ok", lineLocator: "line:1", gapBefore: false },
+          { observationId: "o2", observedAtUtc: "2026-11-30T02:00:00Z", firstSeenAtUtc: "2026-11-30T02:05:00Z", value: null, unit: "degC", bindingValue: null, bindingUnit: "degC", quality: "missing", lineLocator: "line:2", gapBefore: false },
+          { observationId: "o3", observedAtUtc: "2026-11-30T03:00:00Z", firstSeenAtUtc: "2026-11-30T03:05:00Z", value: "-1.5", unit: "degC", bindingValue: "-1.5", bindingUnit: "degC", quality: "ok", lineLocator: "line:3", gapBefore: false },
+        ],
+      },
+      latestEvaluation: null,
+      candidates: [], currentCandidate: null, editorPreview: null, sourcePolicies: [],
+    };
+    const stub = { get: async () => detail, post: async () => ({}) } as unknown as ApiClient;
+    render(<MarketDetail client={stub} bindingId="b1" onError={(e) => { throw e; }} />);
+    const fig = await screen.findByRole("figure", { name: /observed series chart/i });
+    // exactly two plottable values: the real zero and -1.5 — null never coerces
+    expect(fig.querySelectorAll("circle.pt")).toHaveLength(2);
+    // the missing reading is marked, not silently dropped or zeroed
+    expect(fig.querySelectorAll("text.pt.miss")).toHaveLength(1);
+    // the binding threshold is drawn as a line, not only captioned
+    expect(fig.querySelector("line.thr-line")).toBeTruthy();
+    const table = screen.getByTestId("series-table");
+    expect(table.textContent).toContain("missing");
+    expect(table.textContent).toContain("0.0");
+    // series table is wrapped in the scrollable region for narrow viewports
+    expect(document.querySelector(".table-scroll")).toBeTruthy();
+  });
+});
+
+describe("session persistence across refresh", () => {
+  it("a new client resumes through /api/me + sw_csrf cookie, no API key stored", async () => {
+    const keys = await seed(env, "resume-desk");
+    const c1 = client();
+    await c1.login(keys.keys.editor);
+    // happy-dom's jar holds both cookies; only the non-HttpOnly one is readable
+    expect(document.cookie).toContain("sw_csrf=");
+
+    // simulate a plain refresh: a brand-new client keeps only what a real
+    // browser would — the cookie jar and document.cookie, no API key stored
+    const c2 = client();
+    expect(await c2.resume()).toBe(true);
+    expect(c2.role).toBe("editor");
+    expect(c2.deskSlug).toBe("resume-desk");
+    expect(c2.csrf).toBe(c1.csrf); // re-read from sw_csrf, not held in memory
+
+    // App renders the workspace, not the login form, after resume
+    render(<App client={c2} />);
+    await screen.findByRole("link", { name: /market inbox/i });
+
+    // a mutation after "refresh" passes the CSRF check end-to-end
+    const imp = await c2.post<{ marketVersionId: string }>("/api/markets/import", {
+      card: {
+        address: "0xRESUME", question: "q?", competitionId: "arena-1",
+        evidenceCutoffAt: "2999-01-01T00:00:00Z",
+        entryState: { canSubmit: true, remainingOnMarket: 3 },
+      },
+    });
+    expect(imp.marketVersionId).toBeTruthy();
   });
 });

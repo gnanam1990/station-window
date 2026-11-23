@@ -60,6 +60,29 @@ export class ApiClient {
     this.csrf = b.csrf; this.deskSlug = b.desk; this.role = b.role;
     return b;
   }
+
+  /**
+   * Restore a logged-in state after a plain refresh: the HttpOnly session
+   * cookie is sent automatically; the CSRF secret is re-read from the
+   * JS-readable sw_csrf cookie (or supplied by a non-browser transport).
+   * No API key is stored or needed.
+   */
+  async resume(csrf?: string): Promise<boolean> {
+    try {
+      const b = await this.get<{ deskSlug: string; role: string }>("/api/me");
+      this.role = b.role; this.deskSlug = b.deskSlug;
+      this.csrf = csrf ?? this.csrf ?? readCookie("sw_csrf");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function readCookie(name: string): string | null {
+  if (typeof document === "undefined") return null;
+  const m = document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]+)`));
+  return m?.[1] ? decodeURIComponent(m[1]) : null;
 }
 
 const defaultTransport: Transport = async ({ method, path, body, headers }) => {
