@@ -94,13 +94,18 @@ async function migrateOnClient(client: pg.PoolClient): Promise<number[]> {
 
 /** Migrations always run on one checked-out connection so BEGIN/COMMIT are real. */
 export async function migrate(db: Db): Promise<number[]> {
-  if (db instanceof pg.Pool) {
-    const client = await db.connect();
+  const pool = db instanceof pg.Pool ? db : undefined;
+  const client = pool ? await pool.connect() : db as pg.PoolClient;
+  try {
+    // The API and worker both migrate at startup. Keep the entire discovery
+    // and migration sequence on one locked session across per-file commits.
+    await client.query("SELECT pg_advisory_lock(hashtext('station-window/migrations'))");
     try {
       return await migrateOnClient(client);
     } finally {
-      client.release();
+      await client.query("SELECT pg_advisory_unlock(hashtext('station-window/migrations'))");
     }
+  } finally {
+    if (pool) client.release();
   }
-  return migrateOnClient(db as pg.PoolClient);
 }

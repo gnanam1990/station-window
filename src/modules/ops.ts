@@ -98,7 +98,7 @@ async function deskBySlug(db: Db, slug: string) {
 export async function exportDesk(pool: pg.Pool, ctx: RequestContext) {
   // ROLE_RANK puts auditor at the bottom, so requireRole would admit everyone;
   // the export carries desk internals and is deliberately auditor-only
-  if (ctx.role !== "auditor") throw forbidden("auditor_only");
+  if (ctx.role !== "auditor") throw forbidden("auditor_only", "An auditor credential is required to export this desk.");
   const desk = (await pool.query("SELECT * FROM desks WHERE id=$1", [ctx.deskId]))
     .rows[0] as Record<string, unknown>;
   // which source policies forbid exporting their raw bytes?

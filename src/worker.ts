@@ -16,7 +16,7 @@ const config = loadConfig();
 const pool = createPool(config.databaseUrl);
 await migrate(pool);
 const clock = clockFromEnv();
-const roles = (process.env.SW_WORKER_ROLES ?? "ingest,outbox,poll,research")
+const roles = (process.env.SW_WORKER_ROLES ?? "ingest,outbox,poll,research,reconcile")
   .split(",")
   .map((r) => r.trim())
   .filter(Boolean);

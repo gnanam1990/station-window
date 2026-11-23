@@ -11,43 +11,38 @@ export interface WorkerDeps {
   intervalMs?: number;
 }
 
-/** Cooperative worker loop. Each role's tick fn is loaded lazily so missing modules don't block others. */
+/** Schedule the next role tick after its previous invocation settles. */
 export async function runWorkerLoop(deps: WorkerDeps): Promise<() => Promise<void>> {
   const interval = deps.intervalMs ?? 10_000;
-  let stopped = false;
-  const tickers: Record<string, () => Promise<void>> = {};
-
-  for (const role of deps.roles) {
-    try {
-      if (role === "ingest") {
-        const m = await import("../modules/ingest.ts");
-        tickers.ingest = () => m.ingestTick(deps.pool, deps.config, deps.clock);
-      } else if (role === "outbox") {
-        const m = await import("../modules/outbox.ts");
-        tickers.outbox = () => m.outboxTick(deps.pool, deps.config, deps.clock, deps.workerId);
-      } else if (role === "poll") {
-        const m = await import("../modules/outbox.ts");
-        tickers.poll = async () => { await m.pollTick(deps.pool, deps.config, deps.clock); };
-      } else if (role === "research") {
-        const m = await import("../modules/research.ts");
-        tickers.research = () => m.researchTick(deps.pool, deps.clock);
-      } else {
-        console.error(`unknown worker role: ${role}`);
-      }
-    } catch (err) {
-      console.error(`worker role ${role} unavailable:`, (err as Error).message);
-    }
+  const tickers: Record<string, () => Promise<unknown>> = {
+    ingest: async () => (await import("../modules/ingest.ts")).ingestTick(deps.pool, deps.config, deps.clock),
+    outbox: async () => (await import("../modules/outbox.ts")).outboxTick(deps.pool, deps.config, deps.clock, deps.workerId),
+    poll: async () => (await import("../modules/outbox.ts")).pollTick(deps.pool, deps.config, deps.clock),
+    research: async () => (await import("../modules/research.ts")).researchTick(deps.pool, deps.clock),
+    reconcile: async () => (await import("../modules/recovery.ts")).reconcileTick(deps.pool, deps.config, deps.clock),
+  };
+  const roles = [...new Set(deps.roles)];
+  for (const role of roles) {
+    if (!Object.hasOwn(tickers, role)) throw new Error(`Unknown worker role: ${role}`);
   }
+  if (!roles.length) throw new Error("At least one worker role is required");
 
-  const timer = setInterval(() => {
-    for (const [role, fn] of Object.entries(tickers)) {
-      void fn().catch((err) => console.error(`worker role ${role} tick failed:`, (err as Error).message));
-    }
-  }, interval);
-  for (const fn of Object.values(tickers)) void fn().catch(() => {});
-
+  let stopped = false;
+  const timers = new Map<string, NodeJS.Timeout>();
+  const pending = new Map<string, Promise<void>>();
+  function start(role: string) {
+    if (stopped) return;
+    pending.set(role, tickers[role]!()
+      .catch((err: Error) => console.error(`Worker role ${role} tick failed:`, err.message))
+      .then(() => {
+        pending.delete(role);
+        if (!stopped) timers.set(role, setTimeout(() => start(role), interval));
+      }));
+  }
+  for (const role of roles) start(role);
   return async () => {
     stopped = true;
-    clearInterval(timer);
+    for (const timer of timers.values()) clearTimeout(timer);
+    await Promise.all([...pending.values()]);
   };
 }

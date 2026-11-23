@@ -80,6 +80,9 @@ export async function ingestSource(
     httpStatus,
     headers,
     fetchedAt: clock.now(),
+    // INV-10: fetched bytes are live capture; operator-supplied bytes are a
+    // retained historical replay sample — the two never share a label
+    evidenceClass: opts.content !== undefined ? "historical_replay" : "live",
   });
 }
 
@@ -93,7 +96,10 @@ export async function ingestBody(
   clock: Clock,
   p: PolicyRow & { desk_slug?: string },
   body: string,
-  meta: { url: string; httpStatus: number; headers: Record<string, string>; fetchedAt: Date },
+  meta: {
+    url: string; httpStatus: number; headers: Record<string, string>;
+    fetchedAt: Date; evidenceClass?: "live" | "historical_replay" | "fixture";
+  },
 ): Promise<IngestResult> {
   const { snapshotId, digest, parserVersion } = await persistSnapshot(pool, p, body, meta);
   const counts = await parseIntoObservations(pool, clock, p, body, meta, snapshotId, parserVersion);
@@ -107,7 +113,10 @@ export async function ingestBody(
   };
 }
 
-interface SnapMeta { url: string; httpStatus: number; headers: Record<string, string>; fetchedAt: Date }
+interface SnapMeta {
+  url: string; httpStatus: number; headers: Record<string, string>;
+  fetchedAt: Date; evidenceClass?: "live" | "historical_replay" | "fixture";
+}
 
 /** Phase 1: durable snapshot + checkpoint. A crash after this resumes from the row. */
 export async function persistSnapshot(
@@ -130,13 +139,14 @@ export async function persistSnapshot(
     const snap = await client.query(
       `INSERT INTO snapshots
          (id, desk_id, source_policy_id, url, fetched_at, digest, byte_length, content,
-          redacted, http_status, parser_version)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-       ON CONFLICT (source_policy_id, digest) DO UPDATE SET digest=EXCLUDED.digest
+          redacted, http_status, parser_version, evidence_class)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       ON CONFLICT (source_policy_id, digest, evidence_class) DO UPDATE SET digest=EXCLUDED.digest
        RETURNING id`,
       [
         uuid(), p.desk_id, p.id, meta.url, meta.fetchedAt, digest, Buffer.byteLength(body),
         p.can_retain ? Buffer.from(body) : null, !p.can_retain, meta.httpStatus, parserVersion,
+        meta.evidenceClass ?? "historical_replay",
       ],
     );
     const snapshotId = snap.rows[0].id as string;

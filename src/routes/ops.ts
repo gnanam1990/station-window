@@ -3,6 +3,7 @@ import type pg from "pg";
 import type { AppConfig } from "../config.ts";
 import type { Clock } from "../core/clock.ts";
 import { exportDesk, doctor } from "../modules/ops.ts";
+import { integrationReport } from "../modules/report.ts";
 import { reconcileTick } from "../modules/recovery.ts";
 import { requireWorker } from "../auth.ts";
 
@@ -18,8 +19,10 @@ export function registerOpsRoutes(
 
   app.get("/api/ops/doctor", async (req) => doctor(pool, config, clock, req.ctx.deskId));
 
+  app.get("/api/ops/report", async (req) => integrationReport(pool, req.ctx, config, clock));
+
   app.post("/api/ops/reconcile", async (req) => {
     requireWorker(req.ctx);
-    return reconcileTick(pool, config, clock);
+    return reconcileTick(pool, config, clock, req.ctx.deskId);
   });
 }
