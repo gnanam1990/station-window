@@ -71,10 +71,10 @@ export async function createIntent(
   const payloadDigest = sha256(stableJson(payload));
 
   return withTx(pool, async (tx) => {
-    // serialize concurrent creators for the same (account, market, approval)
+    // Every approval on this provider market competes for the same three slots.
     await tx.query(
       "SELECT pg_advisory_xact_lock(hashtext($1))",
-      [`intent:${providerAccount}:${marketAddress}:${input.approvalId}`],
+      [`intent:${providerAccount}:${marketAddress}`],
     );
     const existing = await tx.query(
       `SELECT * FROM intents WHERE provider_account=$1 AND market_address=$2 AND approval_id=$3`,
@@ -89,7 +89,7 @@ export async function createIntent(
          SELECT 1 FROM quota_reservations q
          WHERE q.provider_account=$1 AND q.market_address=$3 AND q.slot_index=g.slot_index
            AND q.state <> 'released')
-       ORDER BY slot_index LIMIT 1 FOR UPDATE`,
+       ORDER BY slot_index LIMIT 1`,
       [providerAccount, SLOT_MAX, marketAddress],
     );
     if (slot.rows.length === 0) throw conflict("quota_exhausted", "no free submission slot on market");
@@ -159,7 +159,7 @@ async function scheduleRetry(db: pg.Pool, intentId: string, nextAt: Date) {
  */
 export async function dispatchTick(
   pool: pg.Pool, config: AppConfig, clock: Clock,
-  opts: { workerId: string; transport?: DelphiTransport; limit?: number },
+  opts: { workerId: string; transport?: DelphiTransport; limit?: number; deskId?: string },
 ): Promise<{ processed: number }> {
   const transport = opts.transport ?? resolveTransport(config);
   const { rows: intents } = await pool.query(
@@ -167,8 +167,9 @@ export async function dispatchTick(
      LEFT JOIN retry_schedule rs ON rs.intent_id=i.id
      WHERE i.state IN ('READY','SENT_UNKNOWN')
        AND (rs.next_at IS NULL OR rs.next_at <= $1)
+       AND ($3::uuid IS NULL OR i.desk_id=$3)
      ORDER BY i.created_at LIMIT $2`,
-    [clock.now(), opts.limit ?? 10],
+    [clock.now(), opts.limit ?? 10, opts.deskId ?? null],
   );
   let processed = 0;
   for (const intent of intents as IntentRow[]) {
@@ -212,7 +213,7 @@ export async function dispatchTick(
       `SELECT rb.market_version_id FROM approvals a JOIN rule_bindings rb ON rb.id=a.rule_binding_id
        WHERE a.id=$1`, [intent.approval_id]);
     const gv = gateMv.rows[0]
-      ? await checkDispatchEligibility(pool, ctx, { marketVersionId: gateMv.rows[0].market_version_id })
+      ? await checkDispatchEligibility(pool, ctx, { marketVersionId: gateMv.rows[0].market_version_id, citationUrls: intent.payload.links })
       : null;
     if (!gv?.eligible) {
       const reasons = gv?.reasons ?? ["gate_unavailable"];
@@ -236,7 +237,7 @@ export async function dispatchTick(
         continue;
       }
       const entry = await transport.getEntryState(intent.market_address);
-      if (!entry.canSubmit) {
+      if (!entry.canSubmit || entry.remainingOnMarket <= 0) {
         await finish("refused:entry_not_submittable");
         await blockIntent(pool, intent, `entry_not_submittable:${entry.reason ?? "provider"}`);
         continue;
@@ -347,24 +348,24 @@ export async function dispatchApproval(
   pool: pg.Pool, ctx: RequestContext, config: AppConfig,
   approvalId: string, _requestId?: string,
 ) {
-  const { intent, created } = await createIntent(pool, ctx, { approvalId });
+  const { intent, created } = await createIntent(pool, ctx, { approvalId, providerAccount: config.delphiAccount });
   const dispatched = await dispatchTick(
-    pool, config, ctx.clock, { workerId: `cli-${process.pid}` });
+    pool, config, ctx.clock, { workerId: `cli-${process.pid}`, deskId: ctx.deskId });
   return { intent, created, dispatched };
 }
 
 /** Poll remote state: judgment and bounty stay separate from the local verdict. */
 export async function pollTick(
   pool: pg.Pool, config: AppConfig, clock: Clock,
-  opts: { transport?: DelphiTransport } = {},
+  opts: { transport?: DelphiTransport; deskId?: string } = {},
 ): Promise<{ polled: number }> {
   const transport = opts.transport ?? resolveTransport(config);
   if (!transport) return { polled: 0 };
   const { rows } = await pool.query(
     `SELECT i.*, r.remote_id FROM intents i
      JOIN receipts r ON r.intent_id=i.id AND r.provider_account=i.provider_account
-     WHERE i.state='REMOTE_KNOWN'`,
-    [],
+     WHERE i.state='REMOTE_KNOWN' AND ($1::uuid IS NULL OR i.desk_id=$1)`,
+    [opts.deskId ?? null],
   );
   let polled = 0;
   for (const intent of rows as (IntentRow & { remote_id: string })[]) {

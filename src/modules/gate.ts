@@ -16,7 +16,7 @@ export interface GateResult {
 export async function checkDispatchEligibility(
   db: Db,
   ctx: RequestContext,
-  opts: { marketVersionId?: string; bindingId?: string },
+  opts: { marketVersionId?: string; bindingId?: string; citationUrls?: string[] },
 ): Promise<GateResult> {
   const reasons: string[] = [];
   const now = ctx.clock.now();
@@ -25,7 +25,7 @@ export async function checkDispatchEligibility(
   const { rows } = await db.query(
     `SELECT mv.id AS mv_id, mv.cutoff_at, mv.eligibility_opens_at, mv.is_competition_entry,
             mv.market_address, mv.rule_revision, mv.competition_id, mv.card_json,
-            rb.id AS rb_id, rb.status AS rb_status, rb.station_id
+            rb.id AS rb_id, rb.status AS rb_status, rb.station_id, rb.dataset, rb.variable
      FROM market_versions mv
      LEFT JOIN LATERAL (SELECT * FROM rule_bindings r WHERE r.market_version_id=mv.id
                         ORDER BY r.version DESC LIMIT 1) rb ON true
@@ -66,18 +66,23 @@ export async function checkDispatchEligibility(
 
   // submission rights: a source policy for the bound station must allow can_submit
   if (r.station_id) {
-    const pol = await db.query(
-      `SELECT can_submit, expires_at, status FROM source_policies
-       WHERE desk_id=$1 AND station_id=$2 AND status='active'
-       ORDER BY policy_version DESC LIMIT 1`,
-      [ctx.deskId, r.station_id],
+    const { rows: policies } = await db.query(
+      `SELECT endpoint_url, can_submit, expires_at, status FROM source_policies
+       WHERE desk_id=$1 AND station_id=$2 AND dataset=$3 AND variable=$4`,
+      [ctx.deskId, r.station_id, r.dataset, r.variable],
     );
-    if (pol.rows.length === 0) reasons.push("no_source_rights");
+    const permitted = (p: typeof policies[number]) =>
+      p.status === "active" && p.can_submit && (!p.expires_at || new Date(p.expires_at) > now);
+    const cited = opts.citationUrls;
+    const missing = cited && (!cited.length || cited.some(url => !policies.some(p => p.endpoint_url === url)));
+    if (!policies.length || missing) reasons.push("no_source_rights");
     else {
-      const p = pol.rows[0];
-      if (!p.can_submit) reasons.push("submission_rights_withdrawn");
-      if (p.expires_at && new Date(p.expires_at as string).getTime() <= now.getTime())
-        reasons.push("rights_expired");
+      const selected = cited ? policies.filter(p => cited.includes(p.endpoint_url)) : policies;
+      const eligible = cited ? selected.every(permitted) : selected.some(permitted);
+      if (!eligible) {
+        if (selected.some(p => p.expires_at && new Date(p.expires_at) <= now)) reasons.push("rights_expired");
+        if (selected.some(p => !p.can_submit || p.status !== "active")) reasons.push("submission_rights_withdrawn");
+      }
     }
   }
 

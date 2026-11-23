@@ -10,7 +10,8 @@ export function registerOutboxRoutes(app: FastifyInstance, db: pg.Pool, config: 
   app.post("/api/intents", async (req) => {
     const body = (req.body ?? {}) as { approvalId?: string; providerAccount?: string };
     if (!body.approvalId) throw badRequest("approvalId required");
-    return createIntent(db, req.ctx, body as { approvalId: string });
+    if (body.providerAccount && body.providerAccount !== config.delphiAccount) throw badRequest("provider account does not match this desk deployment");
+    return createIntent(db, req.ctx, { approvalId: body.approvalId, providerAccount: config.delphiAccount });
   });
 
   app.get("/api/intents", async (req) => {
@@ -40,13 +41,13 @@ export function registerOutboxRoutes(app: FastifyInstance, db: pg.Pool, config: 
     requireWorker(req.ctx);
     const body = (req.body ?? {}) as { workerId?: string; limit?: number };
     return dispatchTick(db, config, req.ctx.clock, {
-      workerId: body.workerId ?? "http-worker", limit: body.limit,
+      workerId: body.workerId ?? "http-worker", limit: body.limit, deskId: req.ctx.deskId,
     });
   });
 
   app.post("/api/outbox/poll", async (req) => {
     requireWorker(req.ctx);
-    return pollTick(db, config, req.ctx.clock);
+    return pollTick(db, config, req.ctx.clock, { deskId: req.ctx.deskId });
   });
 
   app.get("/api/rewards", async (req) => {

@@ -238,3 +238,35 @@ describe("provider wire: markets[] matched by exact address, never by position",
     transport.setJudged(undefined);
   });
 });
+
+describe("shared provider market quota", () => {
+  it("reserves three concurrent approvals, then reuses a released slot without losing its history", async () => {
+    const market = "0xMKT-shared-quota";
+    const editors = await Promise.all(["east", "west", "north", "south"].map(async (region) => {
+      const desk = await seed(env, "quota-" + region);
+      const approval = await approvalFor(desk, market);
+      return { ...desk, ...approval };
+    }));
+    const enqueue = (desk: (typeof editors)[number]) =>
+      api(env, "POST", "/api/intents", { key: desk.keys.editor, payload: { approvalId: desk.approvalId } });
+    const results = await Promise.all(editors.map(enqueue));
+    expect(results.map(r => r.status).sort()).toEqual([200, 200, 200, 409]);
+    const first = editors[results.findIndex(r => r.status === 200)]!;
+    const waiting = editors[results.findIndex(r => r.status === 409)]!;
+    await api(env, "PATCH", `/api/sources/${first.policyId}`, { key: first.keys.editor, payload: { canSubmit: false } });
+    // A different permitted source on this station cannot license the queued citation.
+    await api(env, "POST", "/api/sources", { key: first.keys.editor, payload: {
+      stationId: await stationId("EXAMPLE-A"), dataset: "synthetic", variable: "air_temperature",
+      endpointUrl: "https://training.example/another-source", canSubmit: true,
+    }});
+    const before = transport.submitCalls;
+    const tick = await api(env, "POST", "/api/outbox/tick", { key: first.keys.worker, payload: {} });
+    expect(tick.status).toBe(200);
+    expect(transport.submitCalls).toBe(before);
+    expect((await enqueue(waiting)).status).toBe(200);
+    const slots = await env.pool.query(
+      "SELECT slot_index, state FROM quota_reservations WHERE market_address=$1", [market]);
+    expect(slots.rows.filter(s => s.state === "released")).toHaveLength(1);
+    expect(slots.rows.filter(s => s.state === "reserved").map(s => s.slot_index).sort()).toEqual([1, 2, 3]);
+  });
+});

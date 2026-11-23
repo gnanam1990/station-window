@@ -12,15 +12,15 @@ import { resolveTransport } from "./outbox.ts";
 import { classifyError } from "./delphi.ts";
 
 export async function reconcileTick(
-  pool: pg.Pool, config: AppConfig, clock: Clock,
+  pool: pg.Pool, config: AppConfig, clock: Clock, deskId?: string,
 ): Promise<{ leasesRecovered: number; casesResolved: number; casesOpen: number }> {
   // 1. a crashed worker's expired lease must not strand the intent forever
   const { rowCount: leasesRecovered } = await pool.query(
     `UPDATE intents SET state='READY', updated_at=now()
-     WHERE state='LEASED' AND id IN (
+     WHERE state='LEASED' AND ($2::uuid IS NULL OR desk_id=$2) AND id IN (
        SELECT intent_id FROM attempts
        WHERE finished_at IS NULL AND lease_expires_at < $1)`,
-    [clock.now()],
+    [clock.now(), deskId ?? null],
   );
 
   // 2. resolve open cases by reading provider state for the known remote id
@@ -32,8 +32,8 @@ export async function reconcileTick(
        SELECT remote_id FROM receipts
        WHERE intent_id = rc.intent_id ORDER BY observed_at DESC LIMIT 1
      ) r ON true
-     WHERE rc.resolved_at IS NULL
-     ORDER BY rc.opened_at LIMIT 25`,
+     WHERE rc.resolved_at IS NULL AND ($1::uuid IS NULL OR rc.desk_id=$1)
+     ORDER BY rc.opened_at LIMIT 25`, [deskId ?? null],
   );
   const transport = resolveTransport(config);
   let resolved = 0;
@@ -110,7 +110,7 @@ export async function reconcileTick(
     }
   }
   const { rows: open } = await pool.query(
-    "SELECT count(*)::int AS n FROM reconciliation_cases WHERE resolved_at IS NULL");
+    "SELECT count(*)::int AS n FROM reconciliation_cases WHERE resolved_at IS NULL AND ($1::uuid IS NULL OR desk_id=$1)", [deskId ?? null]);
   return {
     leasesRecovered: leasesRecovered ?? 0,
     casesResolved: resolved,
