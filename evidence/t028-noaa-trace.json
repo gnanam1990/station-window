@@ -1,0 +1,56 @@
+{
+  "generatedAt": "2026-11-23T17:54:19.787Z",
+  "commit": "33daefc",
+  "steps": {
+    "stationBinding": {
+      "accepted": {
+        "station": "46002",
+        "endpoint": "https://www.ndbc.noaa.gov/data/realtime2/46002.txt",
+        "policyId": "a159736d-14b7-4bf0-afbe-def165d7d078"
+      },
+      "rejected": {
+        "status": "rejected",
+        "code": "station_endpoint_mismatch",
+        "station": "46050",
+        "endpoint": "https://www.ndbc.noaa.gov/data/realtime2/46002.txt"
+      }
+    },
+    "liveCapture": {
+      "url": "https://www.ndbc.noaa.gov/data/realtime2/46002.txt",
+      "fetched_at": "2026-11-23T17:54:10.079Z",
+      "digest": "7faab2ecfeb7fa96e86875962c7e428ebabbac50fe3b914fabd56f59b74501e1",
+      "byte_length": 604514,
+      "http_status": 200,
+      "parser_version": "ndbc-realtime2/1",
+      "evidence_class": "live",
+      "inserted": 6429,
+      "note": "real remote fetch — evidence_class=live"
+    },
+    "historicalReplay": {
+      "fromSnapshot": "66130da9-51a1-4919-b69b-782046396024",
+      "replaySnapshot": "4fc23f11-bf88-46a3-8dba-ffdcfed6494a",
+      "evidenceClass": "historical_replay",
+      "digest": "7faab2ecfeb7fa96e86875962c7e428ebabbac50fe3b914fabd56f59b74501e1",
+      "digestMatches": true,
+      "inserted": 0,
+      "note": "retained bytes re-fed as a dated sample — evidence_class=historical_replay"
+    },
+    "evaluationReplay": {
+      "asOf": "2026-11-23T17:54:19.679Z",
+      "first": {
+        "verdict": "interim_fact",
+        "sampleCount": 104,
+        "inputsDigest": "d90c2a13439628274f5c9573b881eade0c149e8f70ae1e86703884f154c46e11",
+        "digest": "c8e6dcd03b8586184166ffb2c1f7086692a67a078f893c969d19b8fed6e38266"
+      },
+      "second": {
+        "verdict": "interim_fact",
+        "sampleCount": 104,
+        "inputsDigest": "d90c2a13439628274f5c9573b881eade0c149e8f70ae1e86703884f154c46e11",
+        "digest": "c8e6dcd03b8586184166ffb2c1f7086692a67a078f893c969d19b8fed6e38266"
+      },
+      "identical": true
+    }
+  },
+  "note": "T-028: live NOAA capture + historical replay + binding accept/reject. Not a live competition judgment — see liveCompetition block in the integration report."
+}

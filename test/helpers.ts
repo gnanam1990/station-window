@@ -66,8 +66,9 @@ export async function login(env: TestEnv, apiKey: string) {
     payload: { apiKey },
   });
   if (res.statusCode !== 200) throw new Error(`login failed: ${res.body}`);
-  const setCookie = res.headers["set-cookie"] as string;
-  const cookie = setCookie.split(";")[0]!;
+  const sc = res.headers["set-cookie"];
+  const setCookie = Array.isArray(sc) ? sc.join("\n") : String(sc ?? "");
+  const cookie = setCookie.match(/sw_session=[^;\n]+/)?.[0] ?? "";
   const body = res.json() as { csrf: string; role: string; desk: string };
   return {
     cookie,

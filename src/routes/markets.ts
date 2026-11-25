@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import type { Db } from "../db/pool.ts";
+import type pg from "pg";
 import { requireRole } from "../auth.ts";
 import { badRequest } from "../core/errors.ts";
 import {
@@ -13,7 +13,7 @@ import {
 } from "../modules/markets.ts";
 import { checkDispatchEligibility } from "../modules/gate.ts";
 
-export function registerMarketRoutes(app: FastifyInstance, db: Db) {
+export function registerMarketRoutes(app: FastifyInstance, db: pg.Pool) {
   app.get("/api/markets", async (req) => {
     requireRole(req.ctx, "auditor");
     return { items: await listMarkets(db, req.ctx) };

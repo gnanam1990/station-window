@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && vite build",
+    "build": "vite build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "migrate": "tsx src/cli.ts migrate",
     "dev": "tsx watch src/server.ts",
@@ -23,18 +23,24 @@
     "doctor": "tsx src/cli.ts doctor"
   },
   "dependencies": {
+    "@fastify/static": "^8.3.0",
+    "@gensyn-ai/gensyn-delphi-sdk": "^2.4.0",
     "fastify": "^5.2.0",
     "pg": "^8.13.1",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "tsx": "^4.19.2"
   },
   "devDependencies": {
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/react": "^14.3.1",
+    "@testing-library/user-event": "^14.6.13",
     "@types/node": "^22.10.0",
     "@types/pg": "^8.11.10",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
-    "tsx": "^4.19.2",
+    "happy-dom": "^21.0.4",
     "typescript": "^5.7.2",
     "vite": "^6.0.3",
     "vitest": "^2.1.8"

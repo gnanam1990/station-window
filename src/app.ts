@@ -47,7 +47,10 @@ export async function buildApp(deps?: Partial<AppDeps>): Promise<FastifyInstance
 
   // -- auth hook: resolves the desk strictly from the credential, never from posted ids --
   app.addHook("preHandler", async (req) => {
-    const publicPaths = ["/api/health", "/api/session"];
+    // @fastify/static registers a public GET/HEAD wildcard. Authorize API
+    // handlers using the route matched by Fastify, including decoded URLs.
+    if ((req.method === "GET" || req.method === "HEAD") && req.routeOptions.url === "/*") return;
+    const publicPaths = ["/api/health", "/api/ready", "/api/live", "/api/session"];
     if (req.method === "GET" && publicPaths.includes(req.routeOptions.url ?? "")) return;
     if ((req.routeOptions.url ?? "").startsWith("/api/health")) return;
     if (req.routeOptions.url === "/api/session" && req.method === "POST") return;
@@ -86,6 +89,8 @@ export async function buildApp(deps?: Partial<AppDeps>): Promise<FastifyInstance
     };
   });
 
+  app.get("/api/live", async () => ({ alive: true }));
+
   app.get("/api/health", async () => {
     const serverTime = clock.now();
     const { rows } = await pool.query("SELECT now() AS db_now");
@@ -113,12 +118,13 @@ export async function buildApp(deps?: Partial<AppDeps>): Promise<FastifyInstance
     const principal = await authenticateApiKey(pool, body.apiKey);
     if (!principal) throw unauthorized("invalid api key");
     const sess = await createSession(pool, principal.id, clock);
-    reply.setCookie("sw_session", sess.token, {
-      httpOnly: true,
-      sameSite: "lax",
-      path: "/",
-      secure: false, // loopback dev; set true behind TLS
-    });
+    // sw_session authenticates (HttpOnly); sw_csrf is JS-readable so the SPA
+    // can resend the CSRF header after a plain page refresh — SameSite=Lax on
+    // both keeps the double-submit guarantee
+    reply.header("set-cookie", [
+      `sw_session=${sess.token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${12 * 3600}`,
+      `sw_csrf=${sess.csrf}; SameSite=Lax; Path=/; Max-Age=${12 * 3600}`,
+    ]);
     return { csrf: sess.csrf, desk: principal.desk_slug, role: principal.role, expiresAt: sess.expiresAt };
   });
 
@@ -129,7 +135,10 @@ export async function buildApp(deps?: Partial<AppDeps>): Promise<FastifyInstance
         sha256(cookies["sw_session"]),
       ]);
     }
-    reply.clearCookie("sw_session", { path: "/" });
+    reply.header("set-cookie", [
+      "sw_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
+      "sw_csrf=; SameSite=Lax; Path=/; Max-Age=0",
+    ]);
     return { ok: true };
   });
 
@@ -143,6 +152,33 @@ export async function buildApp(deps?: Partial<AppDeps>): Promise<FastifyInstance
 
   const { registerMarketRoutes } = await import("./routes/markets.ts");
   registerMarketRoutes(app, pool);
+  const { registerSourceRoutes } = await import("./routes/sources.ts");
+  registerSourceRoutes(app, pool, config, clock);
+  const { registerEvaluationRoutes } = await import("./routes/evaluations.ts");
+  registerEvaluationRoutes(app, pool);
+  const { registerResearchRoutes } = await import("./routes/research.ts");
+  registerResearchRoutes(app, pool);
+  const { registerOutboxRoutes } = await import("./routes/outbox.ts");
+  registerOutboxRoutes(app, pool, config, clock);
+  const { registerDeskRoutes } = await import("./routes/desk.ts");
+  registerDeskRoutes(app, pool);
+  const { registerOpsRoutes } = await import("./routes/ops.ts");
+  registerOpsRoutes(app, pool, config, clock);
+
+  // serve the built workbench when present (npm run build → dist/); the vite
+  // dev server proxies /api instead during development
+  const { existsSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const dist = join(process.cwd(), "dist");
+  if (existsSync(dist)) {
+    const { default: fastifyStatic } = await import("@fastify/static");
+    await app.register(fastifyStatic, { root: dist });
+    app.setNotFoundHandler((req, reply) => {
+      if (req.url.startsWith("/api/"))
+        return reply.code(404).send({ error: { code: "not_found", message: "route not found" } });
+      return reply.sendFile("index.html"); // SPA fallback
+    });
+  }
 
   return app;
 }

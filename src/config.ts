@@ -17,6 +17,8 @@ export interface AppConfig {
   /** Max bytes a source fetcher will download. */
   fetchMaxBytes: number;
   fetchTimeoutMs: number;
+  /** Test/operator injection point for a non-live Delphi transport. Never from env. */
+  transportOverride?: import("./modules/delphi.ts").DelphiTransport;
 }
 
 export function loadConfig(env = process.env): AppConfig {

@@ -1,0 +1,39 @@
+# Full-stack overlay: runs the API + worker next to the compose Postgres.
+#   docker compose -f docker-compose.yml -f deploy/compose.app.yml up -d --build
+# Database is still bound to 127.0.0.1:55432 on the host; containers reach it
+# by service name on the internal network.
+services:
+  api:
+    build: .
+    environment:
+      SW_DATABASE_URL: postgres://station:station_local_dev@postgres:5432/station_window
+      SW_HOST: 0.0.0.0        # inside the container; published on loopback only
+      SW_PORT: "8787"
+      SW_MODE: ${SW_MODE:-dev}
+      SW_LIVE_SUBMISSIONS: ${SW_LIVE_SUBMISSIONS:-no}
+      DELPHI_BASE_URL: ${DELPHI_BASE_URL:-}
+      DELPHI_API_KEY: ${DELPHI_API_KEY:-}
+      DELPHI_ACCOUNT: ${DELPHI_ACCOUNT:-default}
+      DELPHI_AGENT_ID: ${DELPHI_AGENT_ID:-station-window}
+    ports:
+      - "127.0.0.1:8787:8787"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["node", "--import", "tsx", "src/worker.ts"]
+    environment:
+      SW_DATABASE_URL: postgres://station:station_local_dev@postgres:5432/station_window
+      SW_MODE: ${SW_MODE:-dev}
+      SW_LIVE_SUBMISSIONS: ${SW_LIVE_SUBMISSIONS:-no}
+      DELPHI_BASE_URL: ${DELPHI_BASE_URL:-}
+      DELPHI_API_KEY: ${DELPHI_API_KEY:-}
+      DELPHI_ACCOUNT: ${DELPHI_ACCOUNT:-default}
+      DELPHI_AGENT_ID: ${DELPHI_AGENT_ID:-station-window}
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped

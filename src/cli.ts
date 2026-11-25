@@ -155,7 +155,9 @@ try {
     }
     case "restore": {
       const { restoreDesk } = await import("./modules/ops.ts");
-      console.log(JSON.stringify(await restoreDesk(pool, arg("file")!, arg("desk"))));
+      // --replace required to overwrite an existing desk (destructive, explicit)
+      console.log(JSON.stringify(await restoreDesk(
+        pool, arg("file")!, arg("desk"), { replace: args.includes("--replace") })));
       break;
     }
     case "doctor": {
@@ -163,9 +165,23 @@ try {
       console.log(JSON.stringify(await doctor(pool, config, clock), null, 2));
       break;
     }
+    case "report": {
+      const ctx = await deskCtx(arg("desk") ?? "demo", "auditor");
+      const { integrationReport } = await import("./modules/report.ts");
+      const rep = await integrationReport(pool, ctx, config, clock);
+      const out = arg("out");
+      if (out) {
+        const { writeFile, mkdir } = await import("node:fs/promises");
+        const { dirname } = await import("node:path");
+        await mkdir(dirname(out), { recursive: true });
+        await writeFile(out, JSON.stringify(rep, null, 2), { mode: 0o600 });
+        console.log(JSON.stringify({ written: out }));
+      } else console.log(JSON.stringify(rep, null, 2));
+      break;
+    }
     default:
       console.error(
-        "commands: migrate seed catalog import-card ingest evaluate research dispatch outbox poll reconcile replay export backup restore doctor",
+        "commands: migrate seed catalog import-card ingest evaluate research dispatch outbox poll reconcile replay export backup restore doctor report",
       );
       process.exit(2);
   }
